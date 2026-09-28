@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+venv/
+.agents/skills/
+.env
+*.env
+!*.env.example
+**/credentials*.json
+**/*cloud*.json
+
+# Local reverse-engineering tool installs/build caches; keep scripts and curated tools.
+tools/pydeps/
+tools/_work/
+tools/jadx/
+tools/jadx.zip
+tools/jars/*
+
+# Separate upstream checkout; do not accidentally record it as an embedded repo/gitlink.
+apk-reverse/
+
+# Generated decompilation, captures, probe output, device/cloud state, and local secrets.
+work/
+captures/
+*.apk
+*.apks
+*.aab

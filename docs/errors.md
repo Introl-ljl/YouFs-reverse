@@ -1,0 +1,60 @@
+# errors.md — 错误码(阶段 11)
+
+> 全部【B】(classes3 反编译常量)。车辆故障码(ESC 层)不在 APK 内 → 经 DP 上报,语义 UNKNOWN。
+
+## 1. blelib 请求错误(sdk/blelib/Code.java)
+
+| 值 | 常量 | 含义 |
+|---|---|---|
+| 0 | REQUEST_SUCCESS | 成功 |
+| -1 | REQUEST_FAILED | 失败 |
+| -2 | REQUEST_CANCELED | 取消 |
+| -3 | ILLEGAL_ARGUMENT | 参数非法 |
+| -4 | BLE_NOT_SUPPORTED | 不支持 BLE |
+| -5 | BLUETOOTH_DISABLED | 蓝牙未开 |
+| -6 | SERVICE_UNREADY | 服务未就绪 |
+| -7 | REQUEST_TIMEDOUT | 超时 |
+| -8 | REQUEST_OVERFLOW | 溢出 |
+| -9 | REQUEST_DENIED | 拒绝 |
+| -10 | REQUEST_EXCEPTION | 异常 |
+| -11 | REQUEST_UNKNOWN | 未知 |
+
+## 2. 信道层错误(sdk/blelib/channel/Code.java)
+
+`0 SUCCESS / -1 FAIL / -2 TIMEOUT / -3 BUSY`
+
+## 3. GattCode(sdk/ble/core/GattCode.java,BLE 主错误码)
+
+### 配网 CONFIG_1xx
+101 设备信息获取失败 · 102 成功 · 103/104 服务器注册 失败/成功 · 105/106 激活 失败/成功 · 107 配对失败 · 108 配对成功 · **110 AUTH_KEY 错误** · 111 超时 · 112 解绑成功 · 113 取消 · 114 设备已被绑定 · 115 重置密码错误 · 117 准备配对 · 120 未找到设备 · 121 设备信息超时 · 122/123 二次认证/二次认证失败 · 125 设备已绑定 · 130 参数错误 · 131 预激活失败 · 132 国家不匹配 · 135-139 BLE 保留 · 200-213 连接系列(下)
+
+### 连接 CONNECT_2xx
+200 连接状态错误 · 201 发现服务失败 · 202 发现服务成功 · 203 notify 失败 · 204/205 notify one/two · 206 直连失败 · 207 连接中断开 · 208 自动断开 · 209 配对时无连接 · 210 连接/MTU 超时 · 211 连接后断开 · 212 设备信息错误 · 213 版本不支持 · 1 DESTROY_CALLED
+
+### 通道小错误
+258 BLE_ERROR · 259 BLE_DISCONNECT · 260 BLE_BUSY · 261 BLE_NO_DEV_ID · 262 DATA_PARSE · 263 DATA_UPLOAD · 264 DATA_CHECK · 265 BLE_TIME_OUT · 266 DATA_IS_EMPTY
+
+### OTA BZS_3xx
+300 DPS_UPDATE · 301 OTA_START · 302 OTA_FILE_READY · 303 OTA_FILE_FAIL · 304 升级失败 · 305 升级成功 · 306 升级百分比 · 307 OTA 超时
+
+### SDK 大错误(205xxx,节选常量名即含义)
+205200 SEND_ERROR · 205201 NOT_SUPPORT · 205202 PARAM_ERROR · 205203 DPS_INVALID · 205204/205205 FETCH_INFO_ERROR/TIMEOUT · 205206-205212 AUTH_STEP1-4 SERVER/DEVICE_ERROR · 205213 DEVICE_PAIR_TIMEOUT · 205214 OTA_ERROR · 205215 OTA_TIMEOUT · 205216 ACTIVATING · 205217 CONNECTING · 205218 CONNECTED · 205220 WAIT_DEVICE_TIMEOUT · 205221 BLE_SEND_ERROR · 205222 DEVICE_RECEIVE_ERROR · 205223 PUBLISH_DPS_INVALID · 205224 CONNECT_BREAK · 205234 WAIT_EXPAND_DEVICE_TIMEOUT · **205501 ISSUE_BEACON_KEY_ERROR** · 205700 UNKNOWN_ERROR · 2057xx 大数据通道(含 205714 ENCRYPT)· 2051xx BLE 收发分包/超时 · 205141-205157 文件传输(NOT_EXIST/FILE_TOO_BIG/CRC/MD5/TIMEOUT/IS_TRANSFERING…) · **207231 DEVICE_RESET_FAILURE**
+
+## 4. 系统蓝牙绑定错误(BluetoothBondCode.java)
+
+205900 MAC_ILLEGAL · 205901 BLUETOOTH_NOT_ENABLE · 205902 CREATE_BOND_FAIL · 205903 CANCEL_BOND · 205904 CONNECT_FAIL · 205905 DEVICE_NOT_SUPPORT · 205906 READ_FAIL · 205907 DATA_ILLEGAL · 205908 BOND_STATE_TIMEOUT · 205909 NO_FOUND_DEVICE · 205910 REMOVE_BOND_FAIL · 205911 ALREADY_BOND · 205912 NO_SYSTEM_PERMISSION · 205913 HID_ENABLE_FAIL
+(权限:205950 NO_LOCATION / 205951 NO_SCAN / 205952 NO_CONNECT / 205953 NO_ADVERTISE / 205954 SCAN_TIMEOUT / 205955 SCAN_CANCEL)
+
+## 5. 云端错误枚举(字符串)
+
+`DEVICE_ALREADY_BIND`(设备已绑他账号,ResetDeviceManager.java:415)、`GUEST_NOT_SUPPORT_STRONG_BIND`
+(分享设备不支持强绑定,ResetScanDeviceManager.java:385)等,失败映射本地码 207231。
+
+## 6. App 内置故障码表?
+
+**无**【B】:resources.arsc 与 res 数组中无 error_code/fault 表;`faultCode` 在代码中 0 命中。
+车辆故障经面板 DP 上报,文案由云端面板定义 → **YouFs 滑板车故障码语义 UNKNOWN,待 DP 抓包**。
+
+## 7. ACKPacket 状态码(信道层,OTA 通道)
+
+0 SUCCESS · 1 READY · 2 BUSY · 3 TIMEOUT · 4 CANCEL · 5 SYNC(请求重传,seq 指明缺失帧)(ACKPacket.java)
