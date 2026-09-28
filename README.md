@@ -31,7 +31,7 @@ BLE 协议(`com.thingclips.sdk.blelib` + `libBleLib.so`),不存在厂商自研�
 ```powershell
 pip install -e .[ble,dev]      # bleak 仅蓝牙功能需要
 python cli.py scan --all
-python cli.py gatt <目标当前地址>                 # 诊断 GATT，不发应用帧
+python cli.py gatt <目标当前地址> --scan-timeout 60 --timeout 30  # 扫描60秒、连接最多30秒，不发应用帧
 python cli.py connect <目标当前地址> --profile-file work/<已核验配置>.json `
   --service-uuid <实测service> --write-uuid <实测write> --notify-uuid <实测notify>
 ```
@@ -52,6 +52,10 @@ flag 5/key5。若设备信息要求 beaconKey，配置中提供有效 beaconKey 
 PairRep 的 bindStatus 为 0 或 2 才进入 READY。P1、P2、证书/新安全及其他
 未实现分支会 fail closed。该 P4 候选路径尚未确认适用于 YouFs 2。`info` 是单独的 cmd 0 诊断探针；
 cmd 0 应答不等于 READY。
+
+`gatt` 的 `--scan-timeout` 控制发现目标的扫描窗口（默认 60 秒），`--timeout` 单独控制扫描命中后
+BLE 链路连接的超时（默认 20 秒）。扫描命中后会将同一进程捕获的 BLEDevice 直接交给连接器；未命中时
+不会尝试连接地址字符串或触发隐式重扫。
 
 截至 2026-09-28，YouFs 2（App 地址尾号 `00:01`）未出现在本轮扫描结果中；此前捕获到的准确地址
 曾两次连接超时，随后广播消失。因此它的可复现连接、GATT 树、cmd 0/cmd 1 应答均未确认。

@@ -109,6 +109,226 @@ def test_scan_command_discards_nonmatching_results_in_target_mode(monkeypatch,
     assert "other" not in output
 
 
+def test_gatt_uses_independent_scan_and_connection_timeouts(monkeypatch, capsys):
+    import sys
+
+    scan_device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF")
+    captured = {}
+
+    async def fake_scan(address, timeout=8.0):
+        captured["scan"] = (address, timeout)
+        return scan_device
+
+    class FakeBleakClient:
+        def __init__(self, device):
+            captured["client_device"] = device
+            captured["client"] = self
+            self.services = []
+            self.mtu_size = 23
+            self.is_connected = False
+
+        async def connect(self):
+            captured["connected"] = True
+            self.is_connected = True
+
+        async def disconnect(self):
+            captured["disconnected"] = True
+            self.is_connected = False
+
+    async def fake_wait_for(awaitable, timeout):
+        captured["connection_timeout"] = timeout
+        return await awaitable
+
+    monkeypatch.setattr(cli, "_scan_ble_device", fake_scan)
+    monkeypatch.setitem(sys.modules, "bleak",
+                        SimpleNamespace(BleakClient=FakeBleakClient))
+    monkeypatch.setattr(cli.asyncio, "wait_for", fake_wait_for)
+    args = SimpleNamespace(address=scan_device.address, scan_timeout=60.0,
+                           timeout=30.0)
+
+    result = asyncio.run(cli.cmd_gatt(args))
+
+    assert result == 3  # Link reached; fake backend reports no GATT services.
+    assert captured["scan"] == (scan_device.address, 60.0)
+    assert captured["client_device"] is scan_device
+    assert captured["connection_timeout"] == 30.0
+    assert captured["connected"] and captured["disconnected"]
+    capsys.readouterr()
+
+
+def test_gatt_scan_miss_does_not_construct_or_connect_bleak(monkeypatch, capsys):
+    import sys
+
+    calls = []
+
+    async def fake_scan(address, timeout=8.0):
+        calls.append((address, timeout))
+        raise RuntimeError("requested BLE address was not seen")
+
+    class MustNotConnect:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("BLE link must not start when target scan misses")
+
+    monkeypatch.setattr(cli, "_scan_ble_device", fake_scan)
+    monkeypatch.setitem(sys.modules, "bleak",
+                        SimpleNamespace(BleakClient=MustNotConnect))
+    args = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", scan_timeout=45.0,
+                           timeout=30.0)
+
+    result = asyncio.run(cli.cmd_gatt(args))
+
+    assert result == 2
+    assert calls == [(args.address, 45.0)]
+    assert "BLE scan" in capsys.readouterr().out
+
+
+def _gatt_protocol_test_fakes(monkeypatch, *, pair=False):
+    import sys
+    from youfs.transport import SERVICE_UUID, WRITE_CHAR_UUID, NOTIFY_CHAR_UUID
+
+    scan_device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF")
+    write = SimpleNamespace(uuid=WRITE_CHAR_UUID, properties=["write"], descriptors=[])
+    notify = SimpleNamespace(uuid=NOTIFY_CHAR_UUID, properties=["notify"], descriptors=[])
+    service = SimpleNamespace(uuid=SERVICE_UUID, description="", characteristics=[write, notify])
+    captures = {"attach": 0, "disconnect": 0, "fetch": 0, "establish": 0}
+
+    async def fake_scan(address, timeout=8.0):
+        assert address == scan_device.address
+        return scan_device
+
+    class FakeBleakClient:
+        def __init__(self, device):
+            assert device is scan_device
+            self.address = device.address
+            self.services = [service]
+            self.mtu_size = 23
+            self.is_connected = False
+
+        async def connect(self):
+            self.is_connected = True
+
+        async def disconnect(self):
+            captures["disconnect"] += 1
+            self.is_connected = False
+
+    class FakeScooter:
+        def __init__(self, address, **kwargs):
+            assert address == scan_device.address
+            captures["scooter_kwargs"] = kwargs
+            self.transport = SimpleNamespace(
+                is_connected=True, notify_ready=True,
+                service_uuid=kwargs["service_uuid"],
+                write_uuid=kwargs["write_uuid"], notify_uuid=kwargs["notify_uuid"])
+            self.connection = SimpleNamespace(bind_status=True)
+
+        async def attach_connected_client(self, client):
+            assert client.is_connected
+            captures["same_client"] = client
+            captures["attach"] += 1
+
+        async def disconnect(self):
+            captures["disconnect"] += 1
+
+        async def fetch_device_info(self):
+            captures["fetch"] += 1
+            return SimpleNamespace(protocol_version=1, srand=b"123456")
+
+        async def establish_protocol(self, config, timeout):
+            captures["establish"] += 1
+            captures["pair_config"] = config
+            return SimpleNamespace(protocol_version=1)
+
+    monkeypatch.setattr(cli, "_scan_ble_device", fake_scan)
+    monkeypatch.setitem(sys.modules, "bleak", SimpleNamespace(BleakClient=FakeBleakClient))
+    monkeypatch.setattr(scooter, "YouFSScooter", FakeScooter)
+    if pair:
+        monkeypatch.setattr(cli, "_resolve_connection_config",
+                            lambda _args: {"protocolType": 413, "connectType": 0,
+                                           "securityMode": "legacy", "uuid": "u",
+                                           "devId": "d", "localKey": "0123456789abcdef"})
+    return captures
+
+
+def test_gatt_cmd0_reuses_connected_link_and_transport_owns_disconnect(monkeypatch, capsys):
+    from youfs.transport import SERVICE_UUID
+
+    captures = _gatt_protocol_test_fakes(monkeypatch)
+    args = SimpleNamespace(
+        address="AA:BB:CC:DD:EE:FF", scan_timeout=60, timeout=20,
+        probe_cmd0=True, pair=False, protocol_type=413, security_mode="legacy",
+        connect_type=None, cloud_device=None, profile_file=None,
+        target_mac="AA:BB:CC:DD:EE:FF",
+        local_key="0123456789abcdef", service_uuid=None,
+        write_uuid=None, notify_uuid=None, protocol_timeout=2)
+
+    assert asyncio.run(cli.cmd_gatt(args)) == 0
+    assert captures["attach"] == 1
+    assert captures["fetch"] == 1
+    assert captures["establish"] == 0
+    assert captures["disconnect"] == 1
+    output = capsys.readouterr().out
+    assert "cmd 0x0000 response: validated" in output
+    assert "pairing-ready: not established" in output
+    assert "does not imply business protocol readiness" in output
+
+
+def test_gatt_pair_uses_same_link_and_calls_state_machine_once(monkeypatch, capsys):
+    from youfs.transport import SERVICE_UUID
+
+    captures = _gatt_protocol_test_fakes(monkeypatch, pair=True)
+    args = SimpleNamespace(
+        address="AA:BB:CC:DD:EE:FF", scan_timeout=60, timeout=20,
+        probe_cmd0=False, pair=True, protocol_type=413, security_mode="legacy",
+        connect_type=0, cloud_device=None, profile_file=None,
+        target_mac="AA:BB:CC:DD:EE:FF",
+        local_key="0123456789abcdef", service_uuid=None,
+        write_uuid=None, notify_uuid=None, protocol_timeout=2)
+
+    assert asyncio.run(cli.cmd_gatt(args)) == 0
+    assert captures["attach"] == 1
+    assert captures["fetch"] == 0  # state machine performs cmd0 then cmd1
+    assert captures["establish"] == 1
+    assert captures["disconnect"] == 1
+    output = capsys.readouterr().out
+    assert "cmd 0x0001 PairRep: validated" in output
+    assert "No DP or vehicle-control command was sent" in output
+
+
+def test_gatt_pair_refuses_fd50_synthesized_metadata_before_handoff(monkeypatch, capsys):
+    from youfs.transport import SERVICE_UUID
+
+    captures = _gatt_protocol_test_fakes(monkeypatch, pair=True)
+    args = SimpleNamespace(
+        address="AA:BB:CC:DD:EE:FF", scan_timeout=60, timeout=20,
+        probe_cmd0=False, pair=True, protocol_type=None, security_mode=None,
+        connect_type=None, cloud_device=None, profile_file=None,
+        target_mac="AA:BB:CC:DD:EE:FF",
+        local_key="0123456789abcdef", service_uuid=None,
+        write_uuid=None, notify_uuid=None, protocol_timeout=2)
+
+    assert asyncio.run(cli.cmd_gatt(args)) == 4
+    assert captures["attach"] == 0
+    assert captures["establish"] == 0
+    assert captures["disconnect"] == 1
+    output = capsys.readouterr().out
+    assert "diagnostic-only candidate synthesized" in output
+    assert "authorize read-only cmd0 diagnostics only" in output
+
+
+def test_gatt_protocol_probe_rejects_wrong_target_binding_before_scan(monkeypatch, capsys):
+    def unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("identity conflict must be rejected before scanning")
+
+    monkeypatch.setattr(cli, "_scan_ble_device", unexpected_scan)
+    args = SimpleNamespace(
+        address="AA:BB:CC:DD:EE:FF", target_mac="11:22:33:44:55:66",
+        scan_timeout=60, timeout=20, probe_cmd0=True, pair=False,
+        local_key="0123456789abcdef", cloud_device=None, profile_file=None)
+
+    assert asyncio.run(cli.cmd_gatt(args)) == 4
+    assert "before scan" in capsys.readouterr().out
+
+
 def test_transport_error_with_empty_text_keeps_type_and_layer(capsys):
     class EmptyBleError(Exception):
         layer = "BLE link"

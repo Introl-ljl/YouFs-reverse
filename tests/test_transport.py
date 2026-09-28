@@ -33,8 +33,11 @@ class FakeClient:
         self.writes = []
         self.subscriptions = []
         self.events = []
+        self.connect_calls = 0
+        self.disconnect_calls = 0
 
     async def connect(self):
+        self.connect_calls += 1
         self.is_connected = True
 
     async def start_notify(self, characteristic, callback):
@@ -48,9 +51,11 @@ class FakeClient:
         self.mtu_size = value
 
     async def stop_notify(self, characteristic):
-        pass
+        self.events.append(("stop_notify", characteristic))
 
     async def disconnect(self):
+        self.disconnect_calls += 1
+        self.events.append("disconnect")
         self.is_connected = False
 
     async def write_gatt_char(self, characteristic, data, response=False):
@@ -217,6 +222,85 @@ def test_p4_notifies_before_requesting_mtu_and_reports_payload_mtu(monkeypatch):
     assert transport.mtu == 246
     assert transport.payload_mtu == 243
     assert transport.mtu_request_supported is True
+
+
+def test_attach_connected_client_validates_notifies_and_takes_disconnect_ownership():
+    service = FakeService(
+        "0000fd50-0000-1000-8000-00805f9b34fb",
+        [FakeCharacteristic("00000001-0000-1001-8001-00805f9b07d0", ["write"]),
+         FakeCharacteristic("00000002-0000-1001-8001-00805f9b07d0", ["notify"])])
+    write, notify = service.characteristics
+    client = FakeClient("scan-time-device", [service])
+    client.is_connected = True
+    transport = YouFsTransport()
+
+    asyncio.run(transport.attach_connected_client(
+        client, service_uuid=service.uuid, write_uuid=write.uuid,
+        notify_uuid=notify.uuid, protocol_type=413))
+
+    assert client.connect_calls == 0
+    assert transport.is_connected and transport.notify_ready
+    assert client.subscriptions == [notify]
+    assert client.events == ["notify", ("mtu", 246)]
+    assert transport.mtu == 246
+    assert transport.payload_mtu == 243
+    assert transport.requested_mtu == 246
+    assert transport.mtu_request_supported is True
+    assert transport.write_uuid == write.uuid
+
+    asyncio.run(transport.disconnect())
+    assert client.events[-2:] == [("stop_notify", notify), "disconnect"]
+    assert client.disconnect_calls == 1
+    assert not transport.is_connected
+
+
+def test_attach_failure_keeps_client_caller_owned_and_cleans_notify_attempt():
+    service, _, notify = tree()
+    client = FakeClient("scan-time-device", [service],
+                        start_notify_error=OSError("notify rejected"))
+    client.is_connected = True
+    transport = YouFsTransport()
+
+    with pytest.raises(TransportError) as caught:
+        asyncio.run(transport.attach_connected_client(
+            client, service_uuid="a000", write_uuid="a001", notify_uuid="a002"))
+
+    assert caught.value.layer == "notification-subscription"
+    assert client.connect_calls == 0
+    assert client.is_connected  # caller still owns the existing connection
+    assert client.disconnect_calls == 0
+    assert client.events == ["notify", ("stop_notify", notify)]
+    assert not transport.is_connected
+    assert not transport.notify_ready
+
+
+def test_attach_rejects_disconnected_client_without_connecting():
+    service, write, notify = tree()
+    client = FakeClient("scan-time-device", [service])
+    transport = YouFsTransport()
+
+    with pytest.raises(TransportError, match="not connected"):
+        asyncio.run(transport.attach_connected_client(
+            client, service_uuid="a000", write_uuid="a001", notify_uuid="a002"))
+
+    assert client.connect_calls == 0
+    assert client.disconnect_calls == 0
+    assert not transport.is_connected
+
+
+def test_inspect_connected_client_does_not_take_ownership_or_disconnect():
+    service, _, _ = tree()
+    client = FakeClient("scan-time-device", [service])
+    client.is_connected = True
+    transport = YouFsTransport()
+
+    tree_text, candidates = transport.inspect_connected_client(client)
+
+    assert "service a000" in tree_text
+    assert candidates == [("a000", "a001", "a002")]
+    assert transport._client is None
+    assert client.is_connected
+    assert client.connect_calls == client.disconnect_calls == 0
 
 
 def test_connect_passes_scan_time_ble_device_directly_to_bleak(monkeypatch):

@@ -140,6 +140,26 @@ class YouFsTransport:
                     lines.append(f"        desc {desc.uuid}")
         return "\n".join(lines) if lines else "(no services discovered)"
 
+    def inspect_connected_client(
+            self, client: object) -> tuple[str, list[tuple[str, str, str]]]:
+        """Read a connected client's GATT tree without adopting its ownership.
+
+        This is for diagnostics that must inspect services before selecting an
+        explicit UUID triplet. It never connects, subscribes, writes, or
+        disconnects the supplied client.
+        """
+        if client is None or not getattr(client, "is_connected", False):
+            raise TransportError("connection", "cannot inspect a BLE client that is not connected")
+        if self._client is not None and self._client is not client:
+            raise TransportError("connection", "transport already owns a different BLE client")
+
+        previous_client = self._client
+        self._client = client
+        try:
+            return self.list_services(), self.find_candidate_channels()
+        finally:
+            self._client = previous_client
+
     def find_candidate_channels(self) -> list[tuple[str, str, str]]:
         """Return writable/notifiable pairs belonging to the same service."""
         if not self._client or not self._client.is_connected:
@@ -334,6 +354,110 @@ class YouFsTransport:
             await self._close_client()
             raise
 
+    async def attach_connected_client(self, client: object, *,
+                                      service_uuid: str,
+                                      write_uuid: str,
+                                      notify_uuid: str,
+                                      protocol_type: Optional[int] = None) -> None:
+        """Adopt an already-connected BleakClient and prepare its GATT path.
+
+        This method never initiates a BLE connection. On success this transport
+        owns the client and ``disconnect`` will stop notifications and close
+        it. If setup fails, the caller retains ownership; any attempted notify
+        subscription is stopped best-effort before internal state is cleared.
+        """
+        if self._client is not None:
+            raise TransportError("connection", "transport already owns a BLE client")
+        if client is None or not getattr(client, "is_connected", False):
+            raise TransportError(
+                "connection", "cannot attach a BLE client that is not connected")
+
+        previous_protocol_type = self.protocol_type
+        if protocol_type is not None:
+            self.protocol_type = protocol_type
+        try:
+            if not service_uuid or not write_uuid or not notify_uuid:
+                raise TransportError(
+                    "protocol-selection",
+                    "provide the full non-empty service/write/notify UUID triplet")
+            profile = self._resolve_profile(service_uuid, write_uuid, notify_uuid)
+        except Exception:
+            self.protocol_type = previous_protocol_type
+            raise
+
+        # Ownership transfers only if the whole setup succeeds. While setup is
+        # in progress, this reference lets the existing GATT validators inspect
+        # services and lets the callback use the ordinary frame dispatcher.
+        self._client = client
+        self._profile = profile
+        notify_attempted = False
+        notify_char = None
+        try:
+            try:
+                self.mtu = client.mtu_size
+            except Exception:
+                self.mtu = None
+            self.payload_mtu = max(0, self.mtu - 3) if self.mtu is not None else None
+            self.requested_mtu = profile.requested_mtu
+            self.mtu_request_supported = None
+
+            self._write_char, notify_char = self._select_channel(
+                profile.service_uuid, profile.write_uuid, profile.notify_uuid)
+            self._notify_char = notify_char
+
+            def _notify_cb(_char, data: bytearray):
+                try:
+                    result = self._assembler.feed(bytes(data))
+                except ValueError as exc:
+                    log.warning("trsmitr assembly error: %s", exc)
+                    return
+                if result and self.on_frame:
+                    cmd, seq, payload = result
+                    try:
+                        self.on_frame(cmd, seq, payload)
+                    except Exception:  # noqa: BLE001 - never kill the notify loop
+                        log.exception("on_frame callback failed")
+
+            notify_attempted = True
+            try:
+                await client.start_notify(notify_char, _notify_cb)
+            except Exception as exc:  # noqa: BLE001
+                raise TransportError(
+                    "notification-subscription",
+                    f"could not subscribe to {profile.notify_uuid}: {type(exc).__name__}: {exc}",
+                    diagnostic=self.list_services(),
+                ) from exc
+
+            # Match the app's order: notifications are enabled before the P4
+            # MTU request. Some Bleak backends expose only negotiated mtu_size.
+            if profile.requested_mtu is not None:
+                request_mtu = getattr(client, "request_mtu", None)
+                self.mtu_request_supported = callable(request_mtu)
+                if callable(request_mtu):
+                    try:
+                        await request_mtu(profile.requested_mtu)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("MTU request %d failed: %s", profile.requested_mtu, exc)
+                try:
+                    self.mtu = client.mtu_size
+                except Exception:
+                    pass
+                self.payload_mtu = max(0, self.mtu - 3) if self.mtu is not None else None
+
+            self.service_uuid = profile.service_uuid
+            self.write_uuid = profile.write_uuid
+            self.notify_uuid = profile.notify_uuid
+        except Exception:
+            if notify_attempted and notify_char is not None:
+                try:
+                    await client.stop_notify(notify_char)
+                except Exception:  # noqa: BLE001
+                    log.debug("notify cleanup after client adoption failure failed",
+                              exc_info=True)
+            self._reset_client_state()
+            self.protocol_type = previous_protocol_type
+            raise
+
     async def _close_client(self) -> None:
         client, self._client = self._client, None
         self._write_char = None
@@ -343,6 +467,17 @@ class YouFsTransport:
                 await client.disconnect()
             except Exception:  # noqa: BLE001
                 log.debug("BLE disconnect after setup failure failed", exc_info=True)
+
+    def _reset_client_state(self) -> None:
+        self._client = None
+        self._write_char = None
+        self._notify_char = None
+        self._profile = None
+        self.mtu = None
+        self.payload_mtu = None
+        self.requested_mtu = None
+        self.mtu_request_supported = None
+        self._assembler = TrsmitrAssembler()
 
     async def disconnect(self) -> None:
         client = self._client

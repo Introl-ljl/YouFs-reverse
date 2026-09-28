@@ -1,13 +1,12 @@
 """YouFSScooter — high-level async client facade.
 
 Usage:
-    async with YouFSScooter(address, session_key=key_or_none) as scooter:
+    async with YouFSScooter(address, ...) as scooter:
         info = await scooter.fetch_device_info()
 
-Security scope (project constraints):
-  - implemented: scan/connect/device-info/passive DP report reception
-  - never implemented: motor DP, OTA, pairing, unbind
-  - DP queries and writes stay disabled until pairing is implemented and verified
+Security scope:
+  - implemented: BLE/GATT, P4 cmd0 diagnostics, explicit P4 cmd1 handshake
+  - DP queries/writes, motor, OTA, and unbind remain disabled
 """
 
 from __future__ import annotations
@@ -113,6 +112,25 @@ class YouFSScooter:
             protocol_type=self.protocol_type,
             service_uuid=self.service_uuid,
             write_uuid=self.write_uuid, notify_uuid=self.notify_uuid)
+
+    async def attach_connected_client(self, client) -> None:
+        """Adopt an already connected BleakClient without reconnecting.
+
+        Used by the GATT diagnostic path after it has enumerated the services
+        on the live link. Transport validates the selected channel and starts
+        notifications; disconnect ownership then transfers to this scooter.
+        """
+        if self.ble_device is not None:
+            expected = getattr(self.ble_device, "address", None)
+            actual = getattr(client, "address", expected)
+            if expected and actual and (
+                    _normalize_device_address(expected) !=
+                    _normalize_device_address(actual)):
+                raise ValueError("connected BLE client does not match the scan-time BLEDevice")
+        await self.transport.attach_connected_client(
+            client, service_uuid=self.service_uuid,
+            write_uuid=self.write_uuid, notify_uuid=self.notify_uuid,
+            protocol_type=self.protocol_type)
 
     async def disconnect(self) -> None:
         await self.transport.disconnect()

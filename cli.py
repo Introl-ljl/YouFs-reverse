@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""YouFs CLI — scan / info / status / light.
+"""YouFs CLI — scan / GATT / protocol diagnostics / status.
 
 Examples:
     python cli.py scan
     python cli.py info AA:BB:CC:DD:EE:FF --protocol-type 413 --security-mode legacy --cloud-device DEVICE
     python cli.py status AA:BB:CC:DD:EE:FF --protocol-type 413 --security-mode legacy --cloud-device DEVICE
 
-Security scope: light control only; motor/OTA/pair/unbind are not implemented.
+Security scope: opt-in P4 cmd0 diagnostics and cmd1 pairing are gated by the
+verified profile path. DP control, motor, OTA, and unbind remain disabled.
 """
 
 from __future__ import annotations
@@ -187,15 +188,35 @@ def _resolve_local_key(args) -> Optional[bytes]:
     """localKey bytes from --local-key or from the cached cloud device list."""
     spec = getattr(args, "local_key", None)
     dev = getattr(args, "cloud_device", None)
-    if not spec and dev:
-        rec = _find_cached_device(dev)
-        if rec is None:
-            sys.exit(f"{dev!r} not in {DEVICES_STATE}; run `cloud devices` first")
+    profile_path = getattr(args, "profile_file", None)
+    if dev and profile_path:
+        sys.exit("choose one device source: --cloud-device or --profile-file")
+    record = _find_cached_device(dev) if dev else None
+    profile = _load_connection_profile(profile_path)
+    source_spec = ((record or {}).get("localKey") or profile.get("localKey") or
+                   profile.get("local_key"))
+    if spec and source_spec:
+        try:
+            if _local_key_bytes(spec) != _local_key_bytes(source_spec):
+                sys.exit("--local-key conflicts with selected device source")
+        except ValueError as exc:
+            sys.exit(str(exc))
+    if not spec and record:
+        rec = record
         spec = rec.get("localKey")
         if not spec:
             sys.exit(f"no localKey cached for {dev!r}")
         print(f"[cloud] using cached localKey for {rec.get('name')} "
               f"(devId={rec.get('devId')})")
+    if not spec and profile:
+        spec = source_spec
+        if not spec:
+            sys.exit("no localKey in the selected connection profile")
+        print("[profile] using localKey from the workspace profile (value suppressed)")
+    if not spec and dev:
+        rec = _find_cached_device(dev)
+        if rec is None:
+            sys.exit(f"{dev!r} not in {DEVICES_STATE}; run `cloud devices` first")
     if not spec:
         return None
     try:
@@ -357,13 +378,94 @@ async def cmd_scan(args) -> int:
     return 0
 
 
-async def cmd_gatt(args) -> int:
-    """Connect and enumerate the GATT tree, without assuming any UUID.
+def _gatt_channel_from_probe(candidates, args):
+    overrides = (getattr(args, "service_uuid", None),
+                 getattr(args, "write_uuid", None),
+                 getattr(args, "notify_uuid", None))
+    if any(overrides) and not all(overrides):
+        raise ValueError("cmd0 requires a full --service-uuid/--write-uuid/--notify-uuid triplet")
+    if all(overrides):
+        wanted = tuple(str(value).strip().lower() for value in overrides)
+        for candidate in candidates:
+            if tuple(str(value).strip().lower() for value in candidate) == wanted:
+                return candidate
+        raise ValueError("selected GATT UUID triplet is not a discovered writable+notify candidate")
+    if len(candidates) != 1:
+        raise ValueError("cmd0 needs exactly one discovered channel candidate or an explicit UUID triplet")
+    return candidates[0]
 
-    The scooter's real service/characteristic UUIDs are not established
-    (docs/gatt.md: FD50 group vs 1910 legacy Telink group — which one this
-    scooter uses is UNKNOWN). This probe settles it on the first real
-    connection and names the write/notify pair for the frame exchange."""
+
+def _gatt_protocol_hints(args, service_uuid: str) -> tuple[Optional[int], Optional[str], Optional[int], list[str]]:
+    """Resolve explicit metadata or a clearly labeled FD50 P4 diagnostic candidate."""
+    cloud_device = getattr(args, "cloud_device", None)
+    profile_path = getattr(args, "profile_file", None)
+    if cloud_device and profile_path:
+        raise ValueError("choose one device source: --cloud-device or --profile-file")
+    record = _find_cached_device(cloud_device) if cloud_device else None
+    profile = _load_connection_profile(profile_path)
+    protocol_type = getattr(args, "protocol_type", None)
+    if protocol_type is None:
+        protocol_type = profile.get("protocolType", profile.get(
+            "protocol_type", (record or {}).get("protocolType")))
+    security_mode = getattr(args, "security_mode", None)
+    if security_mode is None:
+        security_mode = profile.get("securityMode", profile.get(
+            "security_mode", (record or {}).get("securityMode")))
+    connect_type = getattr(args, "connect_type", None)
+    if connect_type is None:
+        connect_type = profile.get("connectType", profile.get(
+            "connect_type", (record or {}).get("connectType")))
+
+    synthesized = []
+    from youfs.transport import SERVICE_UUID
+    if protocol_type is None and str(service_uuid).lower() == SERVICE_UUID.lower():
+        protocol_type = 413
+        synthesized.append("protocolType=413")
+    if (security_mode is None and protocol_type in (413, 400, 401, 402, 403, 404, 405)
+            and str(service_uuid).lower() == SERVICE_UUID.lower()):
+        security_mode = "legacy"
+        synthesized.append("securityMode=legacy")
+    if type(protocol_type) is not int:
+        raise ValueError("cmd0 requires protocolType as an exact integer from profile/cache or an FD50-only candidate")
+    if str(security_mode).lower() != "legacy":
+        raise ValueError("only the P4 legacy cmd0 candidate is implemented; supply securityMode=legacy")
+    if connect_type is not None and type(connect_type) is not int:
+        raise ValueError("connectType must be an exact integer, not a float or boolean")
+    return protocol_type, "legacy", connect_type, synthesized
+
+
+def _validate_gatt_target_binding(args) -> None:
+    """Require the selected GATT diagnostic credential to be bound to address."""
+    cloud_device = getattr(args, "cloud_device", None)
+    profile_path = getattr(args, "profile_file", None)
+    if cloud_device and profile_path:
+        raise ValueError("choose one device source: --cloud-device or --profile-file")
+    record = _find_cached_device(cloud_device) if cloud_device else None
+    if cloud_device and record is None:
+        raise ValueError(f"{cloud_device!r} is not in {DEVICES_STATE}; refusing protocol probe")
+    profile = _load_connection_profile(profile_path)
+    declared_mac = getattr(args, "target_mac", None)
+    source_mac = ((record or {}).get("mac") or
+                  profile.get("targetMac") or profile.get("target_mac") or
+                  profile.get("mac"))
+    target = _normalize_mac(args.address)
+    if declared_mac and _normalize_mac(declared_mac) != target:
+        raise ValueError("--target-mac does not match the positional BLE address")
+    if source_mac and _normalize_mac(source_mac) != target:
+        raise ValueError("selected profile/cache MAC does not match the BLE address; refusing protocol probe")
+    if not source_mac and not declared_mac:
+        raise ValueError(
+            "protocol probes require a profile/cache MAC or an explicit --target-mac matching the BLE address")
+    if source_mac and declared_mac and _normalize_mac(source_mac) != _normalize_mac(declared_mac):
+        raise ValueError("--target-mac conflicts with the selected profile/cache identity")
+
+
+async def cmd_gatt(args) -> int:
+    """Connect once, enumerate GATT, and optionally probe read-only P4 cmd0.
+
+    The optional --probe-cmd0 and --pair actions reuse this exact BLE link.
+    No protocol frame is sent during the default GATT-only path.
+    """
     from youfs.transport import (LEGACY_NOTIFY_CHAR_UUID, LEGACY_SERVICE_UUID,
                                  LEGACY_WRITE_CHAR_UUID, NOTIFY_CHAR_UUID,
                                  SERVICE_UUID, WRITE_CHAR_UUID, YouFsTransport)
@@ -376,14 +478,34 @@ async def cmd_gatt(args) -> int:
                                       LEGACY_WRITE_CHAR_UUID,
                                       LEGACY_NOTIFY_CHAR_UUID),
     }
+    if getattr(args, "probe_cmd0", False) and getattr(args, "pair", False):
+        print("choose --probe-cmd0 or --pair; --pair performs its own cmd0 before cmd1")
+        return 4
+    wants_protocol = bool(getattr(args, "probe_cmd0", False) or
+                          getattr(args, "pair", False))
+    login_key = None
+    connection_config = None
+    if wants_protocol:
+        try:
+            _validate_gatt_target_binding(args)
+            login_key = _resolve_local_key(args)
+            if login_key is None:
+                raise ValueError("protocol probe requires localKey from --local-key, --cloud-device, or --profile-file")
+            if getattr(args, "pair", False):
+                connection_config = _resolve_connection_config(args)
+        except (RuntimeError, ValueError, SystemExit) as exc:
+            detail = str(exc) or "profile, identity, or key resolution failed"
+            print(f"protocol action refused before scan ({type(exc).__name__}): {detail}")
+            return 4
     try:
         target = await _scan_ble_device(args.address,
-                                       timeout=min(args.timeout, 8.0))
+                                       timeout=args.scan_timeout)
     except Exception as exc:
         _print_connection_error(exc, "BLE scan")
         print("suggestion: keep the powered target advertising and use its current scan address")
         return 2
     client = BleakClient(target)
+    transport_owner = None
     try:
         print(f"BLE link: connecting to {args.address} …")
         await asyncio.wait_for(client.connect(), timeout=args.timeout)
@@ -394,51 +516,99 @@ async def cmd_gatt(args) -> int:
         return 2
     try:
         print(f"connected: {args.address}  mtu={getattr(client, 'mtu_size', '?')}")
-        if not client.services:
+        probe = YouFsTransport()
+        tree_text, candidates = probe.inspect_connected_client(client)
+        if tree_text == "(no services discovered)":
             print("GATT discovery returned no services; inspect the BLE backend, "
                   "device state, and platform permissions. This result does not "
                   "establish that pairing is required.")
             return 3
 
-        # Reuse the transport helpers so there is one implementation.
-        probe = YouFsTransport()
-        probe._client = client
         print("\n--- GATT tree ---")
-        print(probe.list_services())
+        print(tree_text)
 
         print("\n--- data-channel candidates (write + notify pairs) ---")
-        cands = probe.find_candidate_channels()
-        if not cands:
-            print("   (none — no service exposes both a writable and a "
-                  "notifiable characteristic)")
-        for svc_uuid, w, n in cands:
+        if not candidates:
+            print("   (none — no service exposes both a writable and a notifiable characteristic)")
+        for svc_uuid, write_uuid, notify_uuid in candidates:
             tag = known.get(svc_uuid.lower())
             note = f"   <-- {tag[0]}" if tag else ""
-            print(f"   service={svc_uuid}\n      write={w}\n      notify={n}{note}")
+            print(f"   service={svc_uuid}\n      write={write_uuid}\n      notify={notify_uuid}{note}")
 
         print("\n--- verdict ---")
-        found = {s.lower() for s, _, _ in cands}
-        hit = [known[s] for s in found if s in known]
+        hit = [known[s.lower()] for s, _, _ in candidates if s.lower() in known]
         if hit:
-            print(f"   recognised: {hit[0][0]}")
-            selected_service = next((svc for svc, tag in known.items()
-                                     if tag == hit[0]), None)
-            cand = next((c for c in cands
-                         if c[0].lower() == selected_service), None)
-            if cand:
-                print(f"   -> next: python cli.py info {args.address} "
-                      f"--service-uuid {cand[0]} --write-uuid {cand[1]} "
-                      f"--notify-uuid {cand[2]} [--cloud-device <name>]")
+            print(f"   recognised GATT layout: {hit[0][0]}; protocol selection remains separate")
         else:
-            print("   NEITHER documented preset matched. Use the exact candidate "
-                  "triplet from the tree only after confirming it against the "
-                  "device's actual GATT characteristics:")
-            for svc_uuid, write_uuid, notify_uuid in cands:
-                print(f"   python cli.py info {args.address} --service-uuid {svc_uuid} "
-                      f"--write-uuid {write_uuid} --notify-uuid {notify_uuid}")
+            print("   no documented GATT preset matched; observed characteristics are diagnostic only")
+
+        wants_cmd0 = bool(getattr(args, "probe_cmd0", False) or
+                          getattr(args, "pair", False))
+        if not wants_cmd0:
+            print("GATT discovery alone does not establish application readiness.")
+            return 0
+
+        try:
+            channel = _gatt_channel_from_probe(candidates, args)
+            protocol_type, security_mode, connect_type, synthesized = \
+                _gatt_protocol_hints(args, channel[0])
+            if protocol_type not in (413, 400, 401, 402, 403, 404, 405):
+                raise ValueError(f"protocolType {protocol_type} is not a supported P4 cmd0 candidate")
+            if synthesized:
+                print("diagnostic-only candidate synthesized from observed FD50 GATT: " +
+                      ", ".join(synthesized) + "; not an authenticated device profile")
+                if getattr(args, "pair", False):
+                    raise ValueError(
+                        "cmd1 pairing requires protocolType/securityMode from an explicit profile/cache or CLI; "
+                        "FD50-based candidate values authorize read-only cmd0 diagnostics only")
+            if getattr(args, "pair", False):
+                print("pair attempt explicitly requested; only cmd0/cmd1 will be sent, never DP/control")
+
+            from youfs.scooter import YouFSScooter
+            scooter_client = YouFSScooter(
+                args.address,
+                request_timeout=args.protocol_timeout,
+                protocol_type=protocol_type,
+                security_mode=security_mode,
+                login_key=login_key[:6],
+                ble_device=target,
+                service_uuid=channel[0], write_uuid=channel[1],
+                notify_uuid=channel[2])
+            await scooter_client.attach_connected_client(client)
+            transport_owner = scooter_client
+            _report_connection_ready(scooter_client)
+            if connection_config is None:
+                print("cmd 0x0000: sending read-only P4 candidate request …")
+                info = await scooter_client.fetch_device_info()
+                if info is None:
+                    print("cmd 0x0000 response: timeout; protocol/security candidate not validated")
+                    return 3
+                print("cmd 0x0000 response: validated CRC/code/ack/security flag=4")
+                print(f"protocol_version={info.protocol_version}; srand received ({len(info.srand)} bytes; value suppressed)")
+                print("pairing-ready: not established; this probe sent no cmd1 or DP/control")
+            else:
+                print("application handshake: cmd 0x0000 then pairing cmd 0x0001")
+                info = await scooter_client.establish_protocol(
+                    connection_config, timeout=args.protocol_timeout)
+                print(f"cmd 0x0000 response: validated; protocol={info.protocol_version}; security flag=4")
+                print("cmd 0x0001 PairRep: validated")
+                print(f"pairing-ready: established; bind_status={scooter_client.connection.bind_status}")
+                print("No DP or vehicle-control command was sent.")
+        except (RuntimeError, ValueError, SystemExit) as exc:
+            detail = str(exc)
+            if not detail:
+                detail = "profile or key resolution failed"
+            print(f"application protocol refused ({type(exc).__name__}): {detail}")
+            return 4
+        except Exception as exc:
+            _print_connection_error(exc, "GATT/cmd0/cmd1")
+            return 3
     finally:
         try:
-            await client.disconnect()
+            if transport_owner is not None:
+                await transport_owner.disconnect()
+            elif getattr(client, "is_connected", False):
+                await client.disconnect()
         except Exception:  # noqa: BLE001
             pass
     return 0
@@ -767,7 +937,27 @@ def main(argv=None) -> int:
     p = sub.add_parser("gatt", help="connect + enumerate GATT tree (settles "
                                     "which UUID group the scooter uses)")
     p.add_argument("address")
-    p.add_argument("--timeout", type=float, default=20.0)
+    p.add_argument("--scan-timeout", type=float, default=60.0,
+                   help="maximum BLE discovery window in seconds (default: 60)")
+    p.add_argument("--timeout", type=float, default=20.0,
+                   help="BLE link connection timeout in seconds after discovery (default: 20)")
+    _add_local_key_args(p)
+    _add_protocol_args(p, required=False)
+    p.add_argument("--connect-type", type=int, choices=(0,),
+                   help="explicit P4 pairing connectType; only 0 is implemented")
+    p.add_argument("--uuid", help="device UUID from a verified profile")
+    p.add_argument("--dev-id", help="devId from a verified profile")
+    p.add_argument("--profile-file", metavar="PATH",
+                   help="connection JSON profile in workspace work/; required fields gate pairing")
+    p.add_argument("--target-mac",
+                   help="bind pairing credentials to this BLE address; must match the positional address")
+    _add_gatt_args(p)
+    p.add_argument("--probe-cmd0", action="store_true",
+                   help="after GATT discovery, send one read-only P4 cmd0 only with explicit key and verified channel")
+    p.add_argument("--pair", action="store_true",
+                   help="after GATT discovery, run cmd0 and attempt cmd1 pairing from a complete profile; never sends DP/control")
+    p.add_argument("--protocol-timeout", type=float, default=6.0,
+                   help="application response timeout after the BLE link is ready (default: 6)")
     p.set_defaults(func=cmd_gatt)
 
     p = sub.add_parser("info", help="connect + fetch device info (cmd 0)")
