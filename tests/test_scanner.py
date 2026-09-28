@@ -93,3 +93,134 @@ def test_scan_keeps_non_original_fe95_only_in_include_all_diagnostics(monkeypatc
     assert len(results) == 1
     assert results[0].adv is not None and not results[0].adv.original_app_supported
     assert results[0].ble_device is device
+
+
+def test_exact_target_mac_reports_fd50_observation_without_protocol_claim(monkeypatch):
+    import asyncio
+    import sys
+    import types
+
+    device = types.SimpleNamespace(address="C0:DE:00:00:00:01", name="YouFs 2")
+    advert = types.SimpleNamespace(
+        manufacturer_data={},
+        service_uuids=["fd50"],
+        service_data={"fd50": bytes.fromhex("49 0c 00 08 00 00 00 00 00 00 00 00")},
+        rssi=-69)
+
+    class Scanner:
+        def __init__(self, detection_callback):
+            self.callback = detection_callback
+
+        async def start(self):
+            self.callback(device, advert)
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "bleak", types.SimpleNamespace(BleakScanner=Scanner))
+    from youfs.scanner import scan_tuya
+
+    result, = asyncio.run(scan_tuya(
+        timeout=0, target_mac="c0-de-00-00-00-01"))
+    assert result.address == "C0:DE:00:00:00:01"
+    assert result.ble_device is device
+    assert result.target_address_observed
+    assert result.fd50_service_uuid_seen
+    assert result.fd50_service_data_seen
+    assert result.fd50_service_data_length == 12
+    # FD50 is an observation only; no parser or protocol selection is inferred.
+    assert result.adv is None
+
+
+def test_fd50_without_exact_target_match_is_not_recognized_as_a_vehicle(monkeypatch):
+    import asyncio
+    import sys
+    import types
+
+    device = types.SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="unknown")
+    advert = types.SimpleNamespace(
+        manufacturer_data={}, service_uuids=["0000fd50-0000-1000-8000-00805f9b34fb"],
+        service_data={"0000fd50-0000-1000-8000-00805f9b34fb": b"arbitrary"},
+        rssi=-55)
+
+    class Scanner:
+        def __init__(self, detection_callback):
+            self.callback = detection_callback
+
+        async def start(self):
+            self.callback(device, advert)
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "bleak", types.SimpleNamespace(BleakScanner=Scanner))
+    from youfs.scanner import scan_tuya
+
+    assert asyncio.run(scan_tuya(
+        timeout=0, target_mac="C0:DE:00:00:00:01")) == []
+    result, = asyncio.run(scan_tuya(timeout=0, include_all=True))
+    assert not result.target_address_observed
+    assert result.fd50_service_uuid_seen
+    assert result.fd50_service_data_seen
+    assert result.adv is None
+
+
+def test_target_address_match_does_not_depend_on_fd50_payload_layout(monkeypatch):
+    import asyncio
+    import sys
+    import types
+
+    device = types.SimpleNamespace(address="C0:DE:00:00:00:01", name="")
+    advert = types.SimpleNamespace(
+        manufacturer_data={}, service_uuids=[], service_data={"fd50": b"changed"},
+        rssi=-70)
+
+    class Scanner:
+        def __init__(self, detection_callback):
+            self.callback = detection_callback
+
+        async def start(self):
+            self.callback(device, advert)
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "bleak", types.SimpleNamespace(BleakScanner=Scanner))
+    from youfs.scanner import scan_tuya
+
+    result, = asyncio.run(scan_tuya(
+        timeout=0, target_mac="C0:DE:00:00:00:01"))
+    assert result.target_address_observed
+    assert not result.fd50_service_uuid_seen
+    assert result.fd50_service_data_seen
+    assert result.fd50_service_data_length == len(b"changed")
+    assert result.adv is None
+
+
+def test_other_tuya_advertisement_does_not_match_target_mac(monkeypatch):
+    import asyncio
+    import sys
+    import types
+
+    device = types.SimpleNamespace(address="11:22:33:44:55:66", name="lamp")
+    advert = types.SimpleNamespace(
+        manufacturer_data={0x5904: bytes.fromhex("11 22 33 44 55 66 01") + b"keyabcdef"},
+        service_uuids=[], service_data={}, rssi=-40)
+
+    class Scanner:
+        def __init__(self, detection_callback):
+            self.callback = detection_callback
+
+        async def start(self):
+            self.callback(device, advert)
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "bleak", types.SimpleNamespace(BleakScanner=Scanner))
+    from youfs.scanner import scan_tuya
+
+    result, = asyncio.run(scan_tuya(
+        timeout=0, target_mac="C0:DE:00:00:00:01"))
+    assert result.adv is not None and result.adv.kind == "tuya_single_ble"
+    assert not result.target_address_observed

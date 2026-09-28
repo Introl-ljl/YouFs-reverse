@@ -64,6 +64,51 @@ def test_scan_target_fails_when_explicit_address_is_absent(monkeypatch):
         raise AssertionError("scanner selected an unrelated nearby device")
 
 
+def test_scan_command_passes_target_mac_and_reports_fd50_without_protocol_claim(
+        monkeypatch, capsys):
+    captured = {}
+    device = SimpleNamespace(
+        address="DC:17:2A:3B:4C:5D", rssi=-53, name="YouFs2", adv=None,
+        target_address_observed=True, fd50_service_uuid_seen=True,
+        fd50_service_data_seen=False, fd50_service_data_length=None)
+
+    async def fake_scan_tuya(**kwargs):
+        captured.update(kwargs)
+        return [device]
+
+    monkeypatch.setattr("youfs.scanner.scan_tuya", fake_scan_tuya)
+    args = SimpleNamespace(timeout=1.0, name="", all=False,
+                           target_mac="DC:17:2A:3B:4C:5D")
+    result = asyncio.run(cli.cmd_scan(args))
+
+    assert result == 0
+    assert captured["target_mac"] == args.target_mac
+    assert captured["include_all"] is True
+    output = capsys.readouterr().out
+    assert "目标地址已扫描到" in output
+    assert "FD50 service UUID: 已观测" in output
+    assert "FD50: 已观测；协议选择未验证" in output
+    assert "仅扫描，未发送 cmd0 或控制帧" in output
+
+
+def test_scan_command_discards_nonmatching_results_in_target_mode(monkeypatch,
+                                                                  capsys):
+    async def fake_scan_tuya(**_kwargs):
+        return [SimpleNamespace(address="11:22:33:44:55:66", rssi=-40,
+                                name="other", adv=None,
+                                target_address_observed=False)]
+
+    monkeypatch.setattr("youfs.scanner.scan_tuya", fake_scan_tuya)
+    args = SimpleNamespace(timeout=1.0, name="", all=False,
+                           target_mac="DC:17:2A:3B:4C:5D")
+    result = asyncio.run(cli.cmd_scan(args))
+
+    assert result == 1
+    output = capsys.readouterr().out
+    assert "not seen" in output
+    assert "other" not in output
+
+
 def test_transport_error_with_empty_text_keeps_type_and_layer(capsys):
     class EmptyBleError(Exception):
         layer = "BLE link"

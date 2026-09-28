@@ -304,20 +304,51 @@ def _resolve_dp_security(args, local_key: Optional[bytes], *,
 async def cmd_scan(args) -> int:
     from youfs.scanner import scan_tuya
 
+    target_mac = getattr(args, "target_mac", None)
     devices = await scan_tuya(timeout=args.timeout, name_filter=args.name,
-                              include_all=args.all)
+                              include_all=args.all or bool(target_mac),
+                              target_mac=target_mac)
     if not devices:
+        if target_mac:
+            print(f"target address {target_mac} not seen in the scan window")
+            print("No protocol frames were sent.")
+            return 1
         print("no devices found")
         if not args.all:
             print("(only Tuya-style advertisements are listed; pass --all to "
                   "see every BLE device, which is how to identify an unknown "
                   "unit)")
         return 1
+    if target_mac and not any(
+            bool(getattr(device, "target_address_observed", False))
+            for device in devices):
+        print(f"target address {target_mac} not seen; unrelated scan results were discarded")
+        return 1
     print(f"{'address':<20} {'rssi':>5}  {'name':<24} kind / details")
     for d in devices:
         adv = d.adv
+        target_observed = bool(getattr(d, "target_address_observed", False))
+        if target_mac and not target_observed:
+            # Keep the CLI fail-closed even if an alternate scanner adapter
+            # returns an unrelated record.
+            continue
+        if target_observed:
+            fd50_seen = (bool(getattr(d, "fd50_service_uuid_seen", False)) or
+                         bool(getattr(d, "fd50_service_data_seen", False)))
+            print(f"目标地址已扫描到: {d.address}")
+            print("FD50 service UUID: " +
+                  ("已观测" if getattr(d, "fd50_service_uuid_seen", False)
+                   else "未观测"))
+            if getattr(d, "fd50_service_data_seen", False):
+                data_len = getattr(d, "fd50_service_data_length", None)
+                suffix = f" (length={data_len})" if data_len is not None else ""
+                print(f"FD50 service data: 已观测{suffix}")
+            print(f"FD50: {'已观测' if fd50_seen else '未观测'}；"
+                  "协议选择未验证。")
+            print("本次仅扫描，未发送 cmd0 或控制帧。")
         if adv is None:
-            print(f"{d.address:<20} {d.rssi:>5}  {d.name!r:<24} (not Tuya)")
+            note = " (target address observed; no recognized Tuya MFD)" if target_observed else " (not Tuya)"
+            print(f"{d.address:<20} {d.rssi:>5}  {d.name!r:<24}{note}")
             continue
         extra = f"bound={adv.bound} uuid={adv.device_uuid!r}" if adv.device_uuid \
             else f"bound={adv.bound}"
@@ -729,6 +760,8 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true",
                    help="list every BLE device, Tuya or not (identify an "
                         "unknown unit)")
+    p.add_argument("--target-mac",
+                   help="scan for this exact live BLE address even without a recognized Tuya manufacturer advertisement; scan only, no protocol frames")
     p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser("gatt", help="connect + enumerate GATT tree (settles "

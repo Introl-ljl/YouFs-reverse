@@ -31,6 +31,7 @@ BEACON_COMPANY_IDS = {0x5902, 0x5982, 0x6902, 0x6982}
 LEGACY_COMPANY_ID = 0x0259
 STANDARD_COMPANY_ID = 0x07D0
 BEACON_SERVICE_UUID = "000001a2-0000-1000-8000-00805f9b34fb"
+FD50_UUID_FULL = "0000fd50-0000-1000-8000-00805f9b34fb"
 
 # 16-bit form of the service data UUID used by the newer advertising format.
 FE95_UUID_16 = 0xFE95
@@ -155,6 +156,13 @@ class FoundDevice:
     # Keep the scan-time object so callers can connect without Bleak doing an
     # implicit address lookup/re-scan. Never replace this with adv.mac.
     ble_device: Any = None
+    # This only confirms that Windows reported the target's exact BLE address
+    # during this scan. It does not establish an advertisement format or
+    # protocol selector.
+    target_address_observed: bool = False
+    fd50_service_uuid_seen: bool = False
+    fd50_service_data_seen: bool = False
+    fd50_service_data_length: Optional[int] = None
 
 
 def _mac_from_address(address: str) -> Optional[str]:
@@ -182,11 +190,15 @@ def macs_match(scan_address: str, device_mac: str) -> bool:
 
 async def scan_tuya(timeout: float = 8.0,
                     name_filter: str = "",
-                    include_all: bool = False) -> List[FoundDevice]:
+                    include_all: bool = False,
+                    target_mac: Optional[str] = None) -> List[FoundDevice]:
     """Scan for Tuya-advertising BLE devices (requires bleak + a BT adapter).
 
     include_all=True returns every device seen (adv=None when unrecognised),
     which is what to use when identifying an unknown unit in the field.
+    When target_mac is provided, a matching scan-object address is returned
+    even if its advertisement is not recognized. FD50 service UUID/data are
+    recorded as observations only; they never select or enable a protocol.
     """
     import asyncio
 
@@ -198,7 +210,16 @@ async def scan_tuya(timeout: float = 8.0,
         name = device.name or ""
         if name_filter and name_filter.lower() not in name.lower():
             return
+        target_observed = bool(target_mac and macs_match(device.address, target_mac))
         parsed: Optional[TuyaAdv] = None
+        service_data = {
+            _uuid_key(uuid): bytes(data)
+            for uuid, data in (adv.service_data or {}).items()
+        }
+        fd50_data = service_data.get(FD50_UUID_FULL)
+        service_uuids = {
+            _uuid_key(uuid) for uuid in (getattr(adv, "service_uuids", ()) or ())
+        }
         for cid, data in (adv.manufacturer_data or {}).items():
             mfd = struct.pack("<H", cid) + bytes(data)
             parsed = parse_tuya_mfd(mfd, getattr(adv, "service_uuids", ()) or ())
@@ -214,11 +235,16 @@ async def scan_tuya(timeout: float = 8.0,
         # recognized discovery branches, so do not surface it as a candidate
         # in the normal vehicle scan.
         if (parsed is None or not parsed.original_app_supported) and not include_all:
-            return
+            if not target_observed:
+                return
         found[device.address] = FoundDevice(
             name=name, address=device.address,
             rssi=adv.rssi if adv.rssi is not None else -999, adv=parsed,
-            ble_device=device)
+            ble_device=device,
+            target_address_observed=target_observed,
+            fd50_service_uuid_seen=FD50_UUID_FULL in service_uuids,
+            fd50_service_data_seen=fd50_data is not None,
+            fd50_service_data_length=(len(fd50_data) if fd50_data is not None else None))
 
     scanner = BleakScanner(detection_callback=_cb)
     await scanner.start()
