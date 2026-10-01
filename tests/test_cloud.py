@@ -12,7 +12,6 @@ import hashlib
 import hmac
 import json
 import os
-import string
 
 import pytest
 
@@ -21,9 +20,17 @@ from youfs.cloud import (KEY4, SIGN_FIELDS, _swap, compute_sign,
 
 CAP = os.path.join("work", "mumu", "captures")
 
-# The captured app session used these ecode values (one per login); the
-# responses decrypt under exactly one of them.
-ECODE_CANDS = [f"sess0000{d}0000000" for d in string.hexdigits[:16]]
+# The captured app session used one ecode per login; the responses decrypt
+# under exactly one of them. Candidate ecodes are session material, so they
+# live in the local corpus, not in the repo.
+ECODE_CANDS_FILE = os.path.join("work", "mumu", "ecodes.json")
+
+
+def _load_ecode_candidates():
+    if not os.path.isfile(ECODE_CANDS_FILE):
+        pytest.skip("ecode candidate file not present")
+    with open(ECODE_CANDS_FILE, encoding="utf-8") as fh:
+        return json.load(fh)["ecodes"]
 
 
 def _load_capture(prefix, kind="req"):
@@ -84,8 +91,9 @@ def test_payload_key_uses_request_id_as_hmac_key():
     swapped = hmac.new(KEY4, rid.encode(), hashlib.sha256).hexdigest()[:16]
     assert payload_enc_key(rid).decode() != swapped
 
-    with_ecode = payload_enc_key(rid, "sess000010000000")
-    want = hmac.new(rid.encode(), KEY4 + b"_sess000010000000",
+    ecode = "ecode00000000000"
+    with_ecode = payload_enc_key(rid, ecode)
+    want = hmac.new(rid.encode(), KEY4 + b"_" + ecode.encode(),
                     hashlib.sha256).hexdigest()[:16].encode()
     assert with_ecode == want
 
@@ -105,7 +113,7 @@ def test_captured_session_response_decrypts_under_one_ecode():
         pytest.skip("capture response is plaintext")
 
     plain = None
-    for ec in ECODE_CANDS:
+    for ec in _load_ecode_candidates():
         try:
             plain = _decrypt(body["result"], rid, ec)
             break

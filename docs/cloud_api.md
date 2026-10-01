@@ -174,9 +174,10 @@ MuMu 的 x86_64 原生库转译环境在本轮两次附加目标进程时使其�
 ### 9.1 定位方法:解密 App 自己的请求,而不是猜参数
 
 会话请求的 postData/response 用 `enc_key` 加密,而 `enc_key` 需要该会话的 `ecode`。
-ecode 形如 `sess0000X0000000`(前缀 `sess0000` + 1 位 + `0000000`,共 10 个候选),
+ecode 是高熵 16 字符会话串(本次抓包为固定前缀 + 1 位十六进制 + 固定后缀的 16 个候选),
 对抓包逐候选试解即可恢复(脚本 `work/dec_all.py`、`work/dec_req.py`)。
 恢复后 103 组响应全部解密,证据落在 `work/mumu/decrypted/`。
+具体候选值只存在于本地 `work/mumu/ecodes.json`(已 git 忽略),仓库内不含会话串。
 
 **关键**:解密 App 自己的 `smartlife.m.api.batch.invoke` 请求,里面直接列出了它调用的
 子 API 及其参数(见 `work/dec_batch_params.py`)。这比读混淆后的 SDK 源码可靠得多。

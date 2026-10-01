@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from . import commands as C
-from .protocol import (DeviceInfo, Ret, build_app_frame, derive_key4,
-                       derive_key5, parse_device_info, parse_ret)
+from .protocol import (DeviceInfo, Ret, build_app_frame, derive_key14,
+                       derive_key4, derive_key5, dp_encode, parse_device_info,
+                       parse_ret)
 from .telemetry import ScooterState, apply_dp_map, parse_report
 from .transport import YouFsTransport
 
@@ -54,6 +56,8 @@ class YouFSScooter:
                  protocol_type: Optional[int] = None,
                  security_mode: Optional[str] = None,
                  login_key: Optional[bytes] = None,
+                 login_key_complete: Optional[str] = None,
+                 secret_key: Optional[str] = None,
                  ble_device: object = None) -> None:
         self.address = address
         self.session_key = session_key
@@ -61,6 +65,8 @@ class YouFSScooter:
         self.protocol_type = protocol_type
         self.security_mode = security_mode
         self.login_key = login_key
+        self.login_key_complete = login_key_complete
+        self.secret_key = secret_key
         if ble_device is not None:
             device_address = getattr(ble_device, "address", None)
             if not device_address:
@@ -84,6 +90,7 @@ class YouFSScooter:
         self.state = ScooterState()
         self._sn = 0                      # our 4B BE sequence (X2Request.sn=0 first)
         self._peer_sn = 0
+        self._dps_sn = 0                   # pv4 DPS control counter (PairRep resets)
         self._waiters: Dict[int, asyncio.Future] = {}
         self._exchange_keys: Dict[int, bytes] = {}
         self._exchange_lock = asyncio.Lock()
@@ -134,6 +141,25 @@ class YouFSScooter:
 
     async def disconnect(self) -> None:
         await self.transport.disconnect()
+    async def connect_retry(self, attempts: int = 3, backoff_s: float = 20.0) -> None:
+        """connect() with bounded retries across the module's adv pause window.
+
+        Observed on the vehicle: after a disconnect the module pauses
+        advertising for roughly 30-90 s, so one retry after a backoff is
+        often needed. Every attempt uses the same scan-time BLEDevice
+        identity checks as connect().
+        """
+        last_exc: Exception = RuntimeError("unreachable")
+        for i in range(attempts):
+            try:
+                await self.connect()
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                log.warning("connect attempt %d/%d failed: %s", i + 1, attempts, exc)
+                if i + 1 < attempts:
+                    await asyncio.sleep(backoff_s)
+        raise last_exc
 
     def subscribe(self, callback: Callable[[ScooterState], None]) -> None:
         self._subscribers.append(callback)
@@ -141,14 +167,19 @@ class YouFSScooter:
     # -- protocol ------------------------------------------------------------ #
 
     def _on_frame(self, cmd: int, seq: int, payload: bytes) -> None:
-        """trsmitr-complete application frame from the scooter."""
+        """trsmitr-complete application frame from the scooter.
+
+        The APK BaseReceiver never filters by the header's type nibble on
+        receive, so neither do we; the value is logged for evidence only.
+        """
         if cmd != 2:
-            log.warning("ignoring trsmitr command nibble %d (expected X2 type 2)", cmd)
-            return
+            log.info("trsmitr header type nibble %d (app requests use 2)", cmd)
         try:
             keys = {}
             if self.login_key is not None:
                 keys[4] = derive_key4(self.login_key)
+            if self.login_key_complete and self.secret_key:
+                keys[14] = derive_key14(self.login_key_complete, self.secret_key)
             if self.session_key is not None and self.security_flag is not None:
                 keys[self.security_flag] = self.session_key
             keys.update(self._exchange_keys)
@@ -163,6 +194,8 @@ class YouFSScooter:
         fut = self._waiters.pop(ret.sn_ack, None)
         if fut and not fut.done():
             fut.set_result(ret)
+        if self.state_machine_ready:
+            self._service_device_requests(ret)
         if ret.code in (C.REPORT_DP, C.REPORT_DP_TIME, C.REPORT_STATUS_DP):
             report = parse_report(ret.code, ret.data, sn=ret.sn)
             apply_dp_map(self.state, report.dps, _dp_map_spec(self.dp_map))
@@ -176,12 +209,19 @@ class YouFSScooter:
 
     async def _request(self, code: int, data: bytes = b"",
                        wait_sn: Optional[int] = None) -> Optional[Ret]:
-        if code in (C.CMD_DP_QUERY, C.CMD_DP_SEND):
+        if code == C.CMD_DP_SEND:
             raise RuntimeError(
-                "DP request refused: cmd 0x0001 pairing is not implemented "
-                "or verified, so protocol readiness is not established")
+                "generic DP control refused: use the explicitly gated "
+                "send_dp() with an authorized dpId")
+        if code == C.CMD_DP_QUERY and not self.state_machine_ready:
+            raise RuntimeError(
+                "DP query refused: run the verified pairing handshake "
+                "(cmd0/cmd1) first; readiness is not established")
         self._sn += 1
-        frame = build_app_frame(sn=self._sn, sn_ack=self._peer_sn, code=code,
+        # The APK sets ack_sn=0 on app-initiated requests (X2Request builder
+        # bdpdqbp(0)); only replies to device-initiated frames echo the
+        # device's sn (time-sync replies, report ACKs).
+        frame = build_app_frame(sn=self._sn, sn_ack=0, code=code,
                                 data=data, key=self.session_key,
                                 flag=self.security_flag)
         fut: Optional[asyncio.Future] = None
@@ -254,39 +294,130 @@ class YouFSScooter:
         info = await self.connection.establish()
         self.device_info = info
         self.session_key = self.connection.session_key
-        self.security_flag = C.FLAG_LEGACY_5
+        self.security_flag = self.connection.session_flag
+        # Continue the APK's single sn sequence (cmd0=1, cmd1=2, replies 3+)
+        # so no session frame ever reuses a previously sent sn.
+        self._sn = max(self._sn, self.connection._next_sn)
+        # dealWithResponse resets dpsSn to 0 when PairRep confirms binding.
+        self._dps_sn = 0
         return info
+
+    # -- device-initiated session servicing ---------------------------------- #
+
+    @property
+    def state_machine_ready(self) -> bool:
+        """True once a validated PairRep established the session keys."""
+        return (self.security_flag is not None and self.session_key is not None)
+
+    def _tz_units(self) -> int:
+        """Local UTC offset in 0.01-hour units (TimeZoneUtils.bdpdqbp)."""
+        import calendar
+        is_dst = time.daylight and time.localtime().tm_isdst > 0
+        offset_seconds = -time.altzone if is_dst else -time.timezone
+        return int(round(offset_seconds / 3600.0 * 100.0))
+
+    def _send_no_callback(self, code: int, data: bytes, *, sn_ack: int = 0) -> None:
+        """Fire-and-forget reply, encrypted with the session key/flag.
+
+        Commits the shared sn counter so no session frame ever reuses a
+        sequence number (the device drops duplicates as replays).
+        """
+        self._sn += 1
+        frame = build_app_frame(sn=self._sn, sn_ack=sn_ack, code=code,
+                                data=data, key=self.session_key,
+                                flag=self.security_flag)
+        asyncio.get_running_loop().create_task(self._send_frame_task(frame))
+
+    async def _send_frame_task(self, frame: bytes) -> None:
+        try:
+            await self.transport.send_frame(frame)
+        except Exception:  # noqa: BLE001
+            log.exception("failed to send reply frame (code in frame)")
+
+    def _service_device_requests(self, ret: Ret) -> None:
+        """Answer the session's mandatory device-initiated exchanges.
+
+        Evidence (dpqbbpd): time requests 32785/32786/32787 must be answered
+        unconditionally (the APK checks only the rep class — the observed
+        vehicle sends 32785 with an EMPTY payload ~16 ms after PairRep and
+        drops the session if the answer does not come); pv4 DP reports
+        32774/32775 with needAck (b_type bit7 clear) require
+        replayDpsReportAck with the same code and ack_sn = report sn.
+        """
+        try:
+            if ret.code == 32785:
+                ms = int(time.time() * 1000)
+                data = f"{ms:013d}".encode("ascii") + self._tz_units().to_bytes(2, "big")
+                self._send_no_callback(32785, data, sn_ack=ret.sn)
+            elif ret.code == 32786:
+                t = time.localtime()
+                data = bytes([t.tm_year - 2000, t.tm_mon, t.tm_mday,
+                              t.tm_hour, t.tm_min, t.tm_sec,
+                              (t.tm_wday + 1) % 7]) + self._tz_units().to_bytes(2, "big")
+                self._send_no_callback(32786, data, sn_ack=ret.sn)
+            elif ret.code == 32787:
+                t = time.localtime()
+                data = bytes([t.tm_year - 2000, t.tm_mon, t.tm_mday,
+                              t.tm_hour, t.tm_min, t.tm_sec,
+                              (t.tm_wday + 1) % 7]) + self._tz_units().to_bytes(2, "big")
+                self._send_no_callback(32787, data)
+            elif ret.code in (32774, 32775) and len(ret.data) >= 11:
+                version = ret.data[0]
+                rep_sn = int.from_bytes(ret.data[1:5], "big")
+                b_type = ret.data[5]
+                need_ack = (b_type >> 7) == 0
+                if need_ack:
+                    data = bytes([version]) + rep_sn.to_bytes(4, "big") + \
+                        bytes([b_type, ret.data[6] if len(ret.data) > 6 else 0, 0])
+                    self._send_no_callback(ret.code, data, sn_ack=ret.sn)
+        except Exception:  # noqa: BLE001
+            log.exception("failed to service device-initiated request")
 
     # -- public API ----------------------------------------------------------- #
 
     async def fetch_device_info(self) -> Optional[DeviceInfo]:
-        """Perform only the verified P4 legacy cmd0 exchange.
+        """Perform only the verified P4 cmd0 exchange (no pairing).
 
-        Requires an explicit P4 protocol type, explicit legacy security mode,
-        and the device loginKey. GATT success alone does not establish this.
+        security_mode selects the APK branch for connectType=0:
+          legacy — flag4/key4 = MD5(loginKey=localKey[:6])
+          new    — flag14/key14 = MD5(UTF-8(localKey + secKey))
+        Requires the explicit protocol type, mode, and key material. GATT
+        success alone does not establish any of this.
         """
         if self.protocol_type not in (413, 400, 401, 402, 403, 404, 405):
             raise RuntimeError("cmd 0 refused: explicitly select a supported P4 protocolType")
-        if self.security_mode != "legacy":
-            raise RuntimeError("cmd 0 refused: explicitly select verified legacy security mode")
-        if not self.login_key:
-            raise RuntimeError("P4 cmd 0 requires --local-key/--cloud-device (loginKey)")
+        if self.security_mode not in ("legacy", "new"):
+            raise RuntimeError("cmd 0 refused: explicitly select 'legacy' or 'new' security mode")
         payload_mtu = getattr(self.transport, "payload_mtu", None)
         if payload_mtu is None:
             att_mtu = getattr(self.transport, "mtu", None)
             if att_mtu is None:
                 raise RuntimeError("cmd 0 refused: negotiated ATT MTU is unavailable")
             payload_mtu = max(0, int(att_mtu) - 3)
-        self._sn = 0
-        frame = C.device_info_request(
-            self.login_key, int(payload_mtu), sn=0, sn_ack=self._peer_sn)
+        # The APK's SnAckHolder resets on connect and pre-increments: the
+        # first application request carries sn=1, never 0.
+        sn = 1
+        if self.security_mode == "new":
+            if not self.login_key_complete or not self.secret_key:
+                raise RuntimeError(
+                    "new-security cmd 0 requires the cloud localKey (full) and secKey")
+            frame = C.device_info_request_new(
+                self.login_key_complete, self.secret_key,
+                int(payload_mtu), sn=sn, sn_ack=self._peer_sn)
+            expected_flag = C.FLAG_NEW_SECURITY_14
+        else:
+            if not self.login_key:
+                raise RuntimeError("P4 cmd 0 requires --local-key/--cloud-device (loginKey)")
+            frame = C.device_info_request(
+                self.login_key, int(payload_mtu), sn=sn, sn_ack=self._peer_sn)
+            expected_flag = C.FLAG_LEGACY_4
         fut = asyncio.get_running_loop().create_future()
-        self._waiters[0] = fut
+        self._waiters[sn] = fut
         await self.transport.send_frame(frame)
         try:
             ret = await asyncio.wait_for(fut, self.request_timeout)
         except asyncio.TimeoutError:
-            self._waiters.pop(0, None)
+            self._waiters.pop(sn, None)
             log.warning("no device-info response (device may require an "
                         "different protocol/security mode)")
             return None
@@ -294,20 +425,72 @@ class YouFSScooter:
             raise RuntimeError("cmd 0x0000 response CRC mismatch")
         if ret.code != C.CMD_DEVICE_INFO:
             raise RuntimeError(f"cmd 0x0000 got unexpected response code 0x{ret.code:04X}")
-        if ret.sn_ack != 0:
+        if ret.sn_ack != sn:
             raise RuntimeError(f"cmd 0x0000 response acknowledged unexpected sequence {ret.sn_ack}")
-        if ret.flag != 4:
-            raise RuntimeError(f"cmd 0x0000 expected security flag 4, got {ret.flag}")
+        if ret.flag != expected_flag:
+            raise RuntimeError(f"cmd 0x0000 expected security flag {expected_flag}, got {ret.flag}")
         self.device_info = parse_device_info(ret.data)
-        self.session_key = derive_key5(self.login_key, self.device_info.srand)
-        self.security_flag = C.FLAG_LEGACY_5
+        if self.security_mode == "new":
+            if not self.login_key_complete or not self.secret_key:
+                raise RuntimeError("new-security key15 requires localKey+secKey")
+            from .protocol import derive_key15
+            self.session_key = derive_key15(self.login_key_complete,
+                                            self.secret_key,
+                                            self.device_info.srand)
+            self.security_flag = C.FLAG_NEW_SECURITY_15
+        else:
+            self.session_key = derive_key5(self.login_key, self.device_info.srand)
+            self.security_flag = C.FLAG_LEGACY_5
         return self.device_info
 
     async def get_state(self) -> ScooterState:
-        """DP query (cmd 0x0003, empty payload = all DPs)."""
-        raise RuntimeError(
-            "DP query refused: cmd 0x0001 pairing is not implemented or "
-            "verified, so protocol readiness is not established")
+        """Read-only DP query (cmd 0x0003, empty payload = all DPs).
+
+        Only allowed after a verified READY (pairing handshake completed);
+        vehicle DP control (cmd 0x0002) remains refused regardless.
+        """
+        ret = await self._request(C.CMD_DP_QUERY, b"", wait_sn=self._sn + 1)
+        if ret is not None and ret.crc_ok:
+            report = parse_report(ret.code, ret.data, sn=ret.sn)
+            apply_dp_map(self.state, report.dps, _dp_map_spec(self.dp_map))
+        return self.state
+
+    async def send_dp(self, dp_id: int, dp_type: int, value) -> Optional[Ret]:
+        """Send one data point via the P4 pv4 control command (code 0x0027).
+
+        Evidence (dpqbbpd.publishDps, protocol >= 4): payload =
+        [0x00][dpsSn 4B BE] + per DP [dpId 1B][type 1B][len 2B BE][value],
+        with dpsSn a separate counter reset on PairRep and ack_sn=0.
+        Gated on READY and intended only for dpIds explicitly authorized by
+        the vehicle owner and confirmed rw in the cloud schema (dp8
+        headlight_switch, dp15 mode). The DpsSendRep(4) status byte is
+        returned for verification; None means no response before timeout.
+        """
+        if not self.state_machine_ready:
+            raise RuntimeError(
+                "DP send refused: run the verified pairing handshake "
+                "(cmd0/cmd1) first; readiness is not established")
+        value_bytes = dp_encode(dp_id, dp_type, value)[3:]
+        self._dps_sn += 1
+        payload = (b"\x00" + self._dps_sn.to_bytes(4, "big") +
+                   bytes([dp_id & 0xFF, dp_type & 0xFF]) +
+                   len(value_bytes).to_bytes(2, "big") + value_bytes)
+        self._sn += 1
+        frame = build_app_frame(sn=self._sn, sn_ack=0, code=C.CMD_DP_SEND_PV4,
+                                data=payload, key=self.session_key,
+                                flag=self.security_flag)
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._waiters[self._sn] = fut
+        await self.transport.send_frame(frame)
+        try:
+            ret = await asyncio.wait_for(fut, self.request_timeout)
+            if not ret.crc_ok:
+                log.warning("DP send response CRC mismatch (dp %s)", dp_id)
+            return ret
+        except asyncio.TimeoutError:
+            self._waiters.pop(self._sn, None)
+            log.warning("no DP send response for sn=%s", self._sn)
+            return None
 
     async def wait_for_report(self, timeout: float = 8.0) -> ScooterState:
         """Passively wait for the next DP report (e.g. after connect)."""

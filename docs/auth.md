@@ -28,8 +28,11 @@
 key2  = MD5( MD5(secret)      + srand )          (dpqbbpd.java:4210-4224)
 key5  = MD5( loginKey.bytes   + srand )          (dpqbbpd.java:4283-4322)  ← legacy 会话密钥
 key12 = MD5( hexDecode(encryptedAuthKey) + srand )  (dpqbbpd.java:3980-3993)
-key14 = MD5( loginKeyComplete + secretKey 的 ASCII ) (dpqbbpd.java:4042-4100)
-key15 = MD5( MD5(输入)        + srand )          (dpqbbpd.java:4102-4112)  ← new security 会话密钥
+key14 = MD5( UTF-8(loginKeyComplete + secretKey) )  ← 字符串拼接,无分隔符、无内层哈希
+key15 = MD5( UTF-8(loginKeyComplete + secretKey) || srand )  ← 无内层 MD5;实车 2026-09-29 验证
+(2026-09-29 修正:原 key14"是否加 null 分隔"与 key15"MD5(MD5(输入)+srand)"均为误读,
+以 dpqbbpd.getSecretKey14/15 与实车 cmd0(cmd14)/cmd1(cmd15) 通过为准,见
+docs/ble_auth_verification_20260929.md §3。)
 ```
 
 securityFlag → 密钥槽映射(pbpdbqp.java:3447-3462):

@@ -35,8 +35,9 @@ App 内没有任何 `if model == Z1/M1...` 式的车辆型号分支(`scooter/滑
   `pbbqdqp.java:1441-1461` 写入 `deviceType=200`,按 factory 规则落到默认 P2。其余 parser 分支可写入
   100/102 等。故只看到设备名或“Tuya BLE”不足以选协议。
 
-YouFs 2 在本轮没有可复现的目标广播字节或原版连接日志,不能判定它走哪条 parser/连接入口,也不能
-断言它是 P4。`connect --protocol-type`/profile 中的整数必须被看作**显式提供给第三方客户端的
+2026-09-29 已捕获 YouFs 2 的 FD50 广播及 0x07D0 扫描响应，并实测 FD50 GATT；仍没有原版连接
+选择器日志，尚未验证它走哪条 parser/连接入口，也不能单凭 UUID 断言是 P4。
+`connect --protocol-type`/profile 中的整数必须被看作**显式提供给第三方客户端的
 factory selector 假设值**,不是已验证的云字段映射。只有从该目标原版 App 连接记录或目标专属云/本地
 元数据确认了选择器值后,才可使用当前 P4-only 状态机;否则保持 fail closed。
 

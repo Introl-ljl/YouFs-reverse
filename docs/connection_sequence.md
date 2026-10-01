@@ -33,10 +33,11 @@ notify 订阅后才发应用帧。`gatt` 是单独的只读诊断连接，不会
 P1、P2、P4 新安全/证书或其他未覆盖分支均在协议帧发送前拒绝。`info` 只做 cmd 0 探针，cmd 0
 成功不代表 pairing-ready；`status` 不发送 DP 查询，DP 控制也仍 fail closed。
 
-截至 2026-09-28，YouFs 2（App 中记录的地址尾号 `00:01`）未出现在最近扫描结果中；此前捕获的准确
-地址曾两次在 BleakClient 建链时超时，之后广播消失。目标车可复现广告、GATT 树、cmd 0/cmd 1
-应答都未确认，实际 `protocolType`、安全 flag 和密钥路径均为 **unverified**。当前仅通过离线测试；
-未进行实车测试。
+2026-09-29，YouFs 2（地址尾号 `00:01`）重新开机后，已观察到 RANDOM 可连接广播，原生 WinRT
+和 CLI 均取得完整 FD50 GATT 树，通知订阅也实车通过。此前 Bleak connect 超时的唯一原因仍不明确，
+该 API 的超时范围包含服务发现，不能直接称为无线建链失败。
+实际 `protocolType`、安全 flag、密钥路径与 cmd 0/cmd 1 应答仍为 **unverified**，本轮未发送应用帧。
+参见 [实车连接排查报告](ble_diagnosis_20260929.md)。
 
 ## 时序图
 

@@ -159,7 +159,7 @@ def test_write_requires_validated_channel_and_uses_selected_characteristic(monke
     asyncio.run(transport.send_frame(b"payload"))
     assert client.writes
     assert all(record[0] is write for record in client.writes)
-    assert all(record[2] is False for record in client.writes)
+    assert all(record[2] is True for record in client.writes)  # APK writes app frames with Write Request
 
 
 def test_discovery_report_includes_properties_and_descriptors():

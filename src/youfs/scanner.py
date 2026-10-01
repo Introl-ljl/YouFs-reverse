@@ -133,9 +133,10 @@ def parse_tuya_service_data(data: bytes) -> Optional[TuyaAdv]:
     """Parse a 0xFE95 service-data advertisement.
 
     Layout measured on two independent real devices: the 6-byte device MAC
-    sits at [5:11], little-endian (e.g. advert bytes `59 4e 83 83 ed dc` ->
-    MAC 11:22:33:44:55:66). The surrounding bytes are preserved in `raw` but
-    their meaning is NOT established, so nothing is claimed about them.
+    sits at [5:11], little-endian (e.g. advert bytes `01 ee dd cc bb aa` ->
+    MAC AA:BB:CC:DD:EE:01; vectors here are anonymized). The surrounding bytes
+    are preserved in `raw` but their meaning is NOT established, so nothing is
+    claimed about them.
 
     Returns None when the payload is too short to carry a MAC.
     """

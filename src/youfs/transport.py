@@ -527,8 +527,13 @@ class YouFsTransport:
                 ) from exc
 
     async def send_frame(self, payload: bytes) -> None:
-        """Split and write a complete application frame without response."""
-        await self._send(payload, response=False)
+        """Split and write a complete application frame.
+
+        The APK writes application frames with Write Request (XRequest
+        writeNoRsp defaults to false; only OTA data frames set it true), so
+        this uses write-with-response to match the original client.
+        """
+        await self._send(payload, response=True)
 
     async def send_frame_write_response(self, payload: bytes) -> None:
         """Split and write a frame using Write Request for each packet."""

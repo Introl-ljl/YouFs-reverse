@@ -1,0 +1,23 @@
+# Normalize text to LF in the repository; working tree stays native.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted or diffed as text.
+*.apk   binary
+*.apks  binary
+*.aab   binary
+*.zip   binary
+*.jar   binary
+*.png   binary
+*.jpg   binary
+*.so    binary
+*.dex   binary
+*.jsonl binary
+
+# Windows shell scripts are normally edited and executed with CRLF.
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Generated or vendored trees are not part of review.
+work/**             linguist-generated
+captures/**         linguist-generated

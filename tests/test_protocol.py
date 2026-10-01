@@ -57,13 +57,16 @@ def test_trsmitr_multi_packet_roundtrip():
     assert data == payload and cmd == 2
 
 
-def test_trsmitr_gap_raises():
+def test_trsmitr_receiver_accepts_increasing_index_rejects_repeats():
+    # APK BaseReceiver: "index <= last" is the only index error; a skipped
+    # index is tolerated and packets are concatenated in arrival order.
     payload = bytes(range(60))
     packets = trsmitr_encode(payload)
     asm = TrsmitrAssembler()
     asm.feed(packets[0])
+    assert asm.feed(packets[2]) is None  # tolerated gap, frame still incomplete
     with pytest.raises(ValueError):
-        asm.feed(packets[2])
+        asm.feed(packets[1])  # repeat/decrease is rejected
 
 
 # --- application frame ------------------------------------------------------- #
@@ -181,7 +184,8 @@ def test_parse_device_info_exposes_need_beacon_key_flag():
 def test_parse_tuya_service_data_fe95_mac_matches_address():
     """Real 0xFE95 advertisements: the MAC inside the payload must equal the
     device's own BLE address. Two independent devices, both exact matches —
-    this is what fixes the data[5:11]-reversed offset."""
+    this is what fixes the data[5:11]-reversed offset. Vectors are anonymized
+    (MAC and service data rewritten together, same byte layout)."""
     from youfs.scanner import parse_tuya_service_data
 
     cases = [

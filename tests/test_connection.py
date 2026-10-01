@@ -10,8 +10,9 @@ from youfs.connection import (ConnectionError, ConnectionState,
                               DeviceConnectionConfig, PairRep, ProtocolFamily,
                               YouFsConnection, protocol_family_for_type,
                               build_p4_legacy_pair_payload)
-from youfs.protocol import (Ret, build_app_frame, derive_key4, derive_key5,
-                            parse_ret, trsmitr_encode)
+from youfs.protocol import (Ret, build_app_frame, derive_key14, derive_key15,
+                            derive_key4, derive_key5, parse_ret,
+                            trsmitr_encode)
 
 
 def config(**overrides):
@@ -132,8 +133,14 @@ def test_unverified_protocol_or_security_fails_before_exchange(overrides):
         calls.append(args)
         raise AssertionError("fail-closed validation must precede exchange")
 
-    client = YouFsConnection(config(**overrides), exchange, mtu_payload=23,
-                             transport_ready=True)
+    # An unknown securityMode is rejected at profile construction (from_mapping
+    # runs inside the YouFsConnection constructor); the other overrides reach
+    # the pre-exchange validation inside establish().
+    try:
+        client = YouFsConnection(config(**overrides), exchange, mtu_payload=23,
+                                 transport_ready=True)
+    except ConnectionError:
+        return
     with pytest.raises(ConnectionError):
         asyncio.run(client.establish())
     assert calls == []
@@ -303,9 +310,9 @@ def test_cmd0_alone_never_reaches_ready_and_empty_pairrep_fails():
         request = parse_ret(frame, key=response_key)
         if request.code == 0:
             data = bytes([1, 2, 3, 0, 0, 1]) + bytes(range(6))
-            return ret(0, 50, 0, 4,
+            return ret(0, 50, 1, 4,
                        device_info_response(srand=bytes(range(6))), key4)
-        return ret(1, 51, 1, 5, b"", derive_key5(login_key, bytes(range(6))))
+        return ret(1, 51, 2, 5, b"", derive_key5(login_key, bytes(range(6))))
 
     client = YouFsConnection(config(), exchange, mtu_payload=23,
                              transport_ready=True)
@@ -327,9 +334,9 @@ def test_nonaccepted_pairrep_status_does_not_reach_ready(status):
                        timeout):
         request = parse_ret(frame, key=response_key)
         if request.code == C.CMD_DEVICE_INFO:
-            return ret(0, 50, 0, 4,
+            return ret(0, 50, 1, 4,
                        device_info_response(srand=srand), key4)
-        return ret(1, 51, 1, 5, bytes([status]), key5)
+        return ret(1, 51, 2, 5, bytes([status]), key5)
 
     client = YouFsConnection(config(), exchange, mtu_payload=23,
                              transport_ready=True)
@@ -410,3 +417,137 @@ def test_pairrep_apk_flag_and_strict_client_acceptance(status, accepted):
     assert response.apk_success is True  # APK parser accepts any nonempty data.
     assert response.bind_status is accepted  # APK's bindStatus is 0 or 2.
     assert response.accepted is accepted  # Client only marks these READY.
+
+
+# --- new-security path (flag14/key14, flag15/key15) -------------------------- #
+
+def new_security_config(**overrides):
+    values = config()
+    values["securityMode"] = "new"
+    values["secKey"] = "SECkEY123456789"
+    values.update(overrides)
+    return values
+
+
+def test_new_security_cmd0_uses_key14_flag14_and_sn1():
+    captured = []
+    local_key = "abcdef1234567890"
+    sec_key = "SECkEY123456789"
+    key14 = derive_key14(local_key, sec_key)
+    srand = bytes((9, 8, 7, 6, 5, 4))
+
+    async def exchange(frame, *, expected_sn, response_key, response_flag,
+                       timeout):
+        request = parse_ret(frame, key=response_key)
+        captured.append((request, expected_sn, response_flag))
+        assert expected_sn == 1 and response_flag == 14
+        # proto 4.0: security-update support/enable live in flag2 bits 1/2.
+        info = device_info_response(srand=srand, protocol=(4, 0), flag2=0x06)
+        return ret(0, 100, expected_sn, 14, info, key14)
+
+    client = YouFsConnection(new_security_config(), exchange, mtu_payload=23,
+                             transport_ready=True)
+    info = asyncio.run(client.establish.__wrapped__(client)) if False else None
+    # run only cmd0 by aborting after device info via a cmd1 exchange failure
+    try:
+        asyncio.run(client.establish())
+    except ConnectionError:
+        pass
+    request, expected_sn, response_flag = captured[0]
+    assert request.code == C.CMD_DEVICE_INFO
+    assert request.data == (23).to_bytes(2, "big")
+    assert request.sn == 1 and request.sn_ack == 0
+    assert client.device_info is not None
+    assert client.device_info.srand == srand
+
+
+def test_new_security_full_handshake_reaches_ready_with_flag15():
+    local_key = "abcdef1234567890"
+    sec_key = "SECkEY123456789"
+    login_key = local_key[:6].encode("utf-8")
+    key14 = derive_key14(local_key, sec_key)
+    srand = bytes((9, 8, 7, 6, 5, 4))
+    key15 = derive_key15(local_key, sec_key, srand)
+    captured = []
+
+    async def exchange(frame, *, expected_sn, response_key, response_flag,
+                       timeout):
+        request = parse_ret(frame, key=response_key)
+        captured.append((request, expected_sn, response_flag))
+        if request.code == C.CMD_DEVICE_INFO:
+            assert expected_sn == 1 and response_flag == 14
+            info = device_info_response(srand=srand, protocol=(4, 0),
+                                        flag2=0x06)
+            return ret(0, 100, 1, 14, info, key14)
+        assert expected_sn == 2 and response_flag == 15
+        assert request.sn == 2 and request.sn_ack == 0
+        return ret(1, 101, 2, 15, b"\x02", key15)
+
+    client = YouFsConnection(new_security_config(), exchange, mtu_payload=23,
+                             transport_ready=True)
+    asyncio.run(client.establish())
+    assert client.state is ConnectionState.READY
+    assert client.session_flag == 15
+    assert client.session_key == key15
+    assert client.bind_status is True
+    # cmd1 request encrypted with key15 carries the APK new-security tail:
+    # loginKeyComplete + secretKey + 4 zero verifyKey bytes after marker 0x01.
+    pair_request = captured[1][0]
+    expected_tail = (local_key.encode("utf-8") + sec_key.encode("utf-8") +
+                     b"\x00" * 4)
+    assert pair_request.data.endswith(b"\x01" + expected_tail)
+    assert len(pair_request.data) == 16 + 6 + 22 + 1 + 1 + len(expected_tail)
+
+
+def test_new_security_refused_when_device_lacks_security_update_support():
+    key14 = derive_key14("abcdef1234567890", "SECkEY123456789")
+    calls = []
+
+    async def exchange(frame, *, expected_sn, response_key, response_flag,
+                       timeout):
+        request = parse_ret(frame, key=response_key)
+        calls.append(request.code)
+        info = device_info_response(srand=bytes(6), protocol=(4, 0), flag2=0x00)
+        return ret(0, 100, expected_sn, 14, info, key14)
+
+    client = YouFsConnection(new_security_config(), exchange, mtu_payload=23,
+                             transport_ready=True)
+    with pytest.raises(ConnectionError, match="supportSecurityUpdate"):
+        asyncio.run(client.establish())
+    assert calls == [C.CMD_DEVICE_INFO]
+
+
+def test_new_security_refused_without_seckey_before_any_exchange():
+    calls = []
+
+    async def exchange(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("no exchange without secKey")
+
+    cfg = new_security_config()
+    cfg.pop("secKey")
+    client = YouFsConnection(cfg, exchange, mtu_payload=23,
+                             transport_ready=True)
+    with pytest.raises(ConnectionError, match="secKey"):
+        asyncio.run(client.establish())
+    assert calls == []
+
+
+def test_new_security_server_auth_flag_refuses_cmd1():
+    key14 = derive_key14("abcdef1234567890", "SECkEY123456789")
+    calls = []
+
+    async def exchange(frame, *, expected_sn, response_key, response_flag,
+                       timeout):
+        request = parse_ret(frame, key=response_key)
+        calls.append(request.code)
+        # flag bit1 (0x02) = v4NeedAuth → server-cert path, not implementable.
+        info = device_info_response(srand=bytes(6), protocol=(4, 0), flags=0x02,
+                                    flag2=0x06)
+        return ret(0, 100, expected_sn, 14, info, key14)
+
+    client = YouFsConnection(new_security_config(), exchange, mtu_payload=23,
+                             transport_ready=True)
+    with pytest.raises(ConnectionError, match="v4/server authentication"):
+        asyncio.run(client.establish())
+    assert calls == [C.CMD_DEVICE_INFO]

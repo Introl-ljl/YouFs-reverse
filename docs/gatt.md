@@ -1,13 +1,13 @@
 # gatt.md — GATT Profile(UUID)
 
-> 证据等级:【B】= APK 代码确认(classes3 反编译,文件:行号见文内)。动态验证(【A】)待 HCI 抓包。
+> 证据等级:【B】= APK 代码确认。2026-09-29 目标 GATT 经 Windows 实车验证（observed）；应用协议 HCI 仍待抓包。
 
 ## YouFs 2 当前状态与实车操作顺序【observed / unverified】
 
-截至 2026-09-28，目标是 App 中名称为 **YouFs 2**、蓝牙地址尾号 `00:01` 的车辆。现有扫描结果
-没有出现该车，因此目标地址、广播载体、GATT profile、`protocolType` 和安全 flag 均未在 YouFs 2
-上确认。下方 UUID 是 APK 中存在的协议候选，不代表这辆车一定使用它们；其他 Tuya 设备的扫描或
-连接结果也不构成 YouFs 实车证据。
+2026-09-29，App 中名称为 **YouFs 2**、地址尾号 `00:01` 的车辆已实测成功：RANDOM 地址类型，
+CONNECTABLE_UNDIRECTED 广播，GATT 为下方 FD50 组，MTU 247；通知订阅后保持观察 20 秒。
+普通广播没有 manufacturer data，但主动扫描响应含 0x07D0 厂商数据和名称 demo。
+`protocolType`、安全 flag 和应用认证仍未验证。证据与边界见 [本轮报告](ble_diagnosis_20260929.md)。
 
 实车确认顺序：
 
@@ -63,11 +63,10 @@ Write   : 00002b11-0000-1000-8000-00805f9b34fb   (qpqqdbp.java:21-23; bqdpddd.ja
 Notify  : 00002b10-0000-1000-8000-00805f9b34fb
 ```
 
-即 Telink OTA/透传 UUID 组。哪个 delegate 生效由 APK factory selector 决定；selector 的入口和扫描覆盖规则见 models.md。**YouFs 滑板车实际使用哪一组:UNKNOWN(待抓包)**。
+即 Telink OTA/透传 UUID 组。哪个 delegate 生效由 APK factory selector 决定；selector 的入口和扫描覆盖规则见 models.md。**本次目标车实测为 FD50 组；这不单独确认 factory selector。**
 
 > **两组常量都已由 APK 源码证实存在**(FD50 组 `pqbqbdb.java:18-20` + `bppdpdq.java:759`;
-> 1910 组 `pqbqbdb.java:8-11` + `qpqqdbp.java:21-24`),不是推测——但哪一组属于这台滑板车
-> 仍是 UNKNOWN。
+> 1910 组 `pqbqbdb.java:8-11` + `qpqqdbp.java:21-24`)。2026-09-29 已确认目标车使用 FD50 GATT 布局。
 >
 > **实机首次连接先跑 `python cli.py gatt <BLE_Mac>`**:连上后枚举完整 GATT 树、列出所有
 > writable+notifiable 配对,并直接判断属于哪一组,不需要猜。(该探针曾对一台非 YouFs 的真实
@@ -89,7 +88,8 @@ Notify  : 00002b10-0000-1000-8000-00805f9b34fb
 manufacturer data。** 只按 company id 过滤会**一个都扫不到**。
 
 本机实测两台真实设备(2026-09-28,`cli.py scan`)。这是**观测,不是型号规律**——
-只能说明这种广播确实存在于现实中,不能说某代模块一定用它:
+只能说明这种广播确实存在于现实中,不能说某代模块一定用它。下表向量已做匿名化替换
+(MAC 与 service data 同步改写,字节布局与真实抓包一致):
 
 | 设备名 | service data (hex) | 其中 MAC |
 |---|---|---|

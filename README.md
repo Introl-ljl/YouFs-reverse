@@ -12,19 +12,21 @@ BLE 协议(`com.thingclips.sdk.blelib` + `libBleLib.so`),不存在厂商自研�
 |---|---|
 | [app_info.md](docs/app_info.md) | APK 结构、SDK 清单、框架识别 |
 | [ble.md](docs/ble.md) | BLE 入口类清单(阶段 2) |
-| [gatt.md](docs/gatt.md) | GATT UUID:service `FD50`,TX char `0001`,RX char `0002` |
+| [gatt.md](docs/gatt.md) | GATT UUID:service `FD50`,TX char `0001`,RX char `0002`(已实车验证) |
 | [connection_sequence.md](docs/connection_sequence.md) | 连接→MTU 246→notify→cmd 0→cmd 1 配对→就绪 |
 | [protocol.md](docs/protocol.md) | 三层帧格式:trsmitr 分帧 / AES-CBC 应用帧 / DP TLV |
 | [checksum.md](docs/checksum.md) | CRC-8(poly07)、CRC-16/ARC、CRC-16/MODBUS |
-| [auth.md](docs/auth.md) | 鉴权与密钥派生(MD5 系;无静态固定 key) |
-| [commands.md](docs/commands.md) | 命令号总表;滑板车业务 DP 全部 UNKNOWN 待抓包 |
-| [telemetry.md](docs/telemetry.md) | 0x8001/0x8004 上报解析;字段映射表待填 |
+| [auth.md](docs/auth.md) | 鉴权与密钥派生(MD5 系;key14/key15 公式已按实车修正) |
+| [commands.md](docs/commands.md) | 命令号总表;业务 DP 由云端 schema 补齐 |
+| [telemetry.md](docs/telemetry.md) | 0x8001/0x8004 上报解析;字段映射表 |
 | [models.md](docs/models.md) | APK delegate factory selector 来源与分支映射；不能仅凭车型判断 |
 | [errors.md](docs/errors.md) | GattCode/blelib/BondCode 全量错误码 |
 | [ota.md](docs/ota.md) | OTA 仅静态分析,**DO NOT EXECUTE** |
-| [capture_analysis.md](docs/capture_analysis.md) | 动态抓包方案与记录模板(待硬件) |
+| [capture_analysis.md](docs/capture_analysis.md) | 动态抓包方案与记录模板 |
 | [emulator_validation.md](docs/emulator_validation.md) | MuMu 原版 App 验证、面板代码线索与未解决项 |
-| [cloud_api.md](docs/cloud_api.md) | 云端 API 静态还原;签名联调待动态核验 |
+| [cloud_api.md](docs/cloud_api.md) | 云端 API：签名/加密配方与设备/DP schema 还原 |
+| [ble_diagnosis_20260929.md](docs/ble_diagnosis_20260929.md) | 2026-09-29 实车连接排查(广播/GATT/通知订阅) |
+| [ble_auth_verification_20260929.md](docs/ble_auth_verification_20260929.md) | 2026-09-29 实车认证与控制验证(cmd0/cmd1、保活、dp8/dp15) |
 
 ## 快速开始
 
@@ -45,39 +47,45 @@ factory 入参名为 `ControllerBean.deviceType`，其来源受扫描分支或�
 云端 `DeviceBean.protocolType`。`connectType`、`securityMode`、UUID、devId 与密钥材料也必须有
 目标专属依据。不要用设备名或默认 UUID 推断协议。
 
-当前离线状态机只允许 APK 证据支持的 P4 factory selector（400–405、413）普通旧安全候选路径
-（`connectType=0`、`securityMode=legacy`）：加密 cmd 0 使用 flag 4/key4，cmd 1 使用
-flag 5/key5。若设备信息要求 beaconKey，配置中提供有效 beaconKey 时使用 marker `0x10` 分支；
-缺失时遵循原版 normal path 的 marker `0x00` fallback，cmd 1 仍为 key5/flag5 加密。只有 cmd 1
-PairRep 的 bindStatus 为 0 或 2 才进入 READY。P1、P2、证书/新安全及其他
-未实现分支会 fail closed。该 P4 候选路径尚未确认适用于 YouFs 2。`info` 是单独的 cmd 0 诊断探针；
-cmd 0 应答不等于 READY。
+当前离线状态机覆盖 APK 证据支持的 P4 factory selector（400–405、413），并要求显式指定安全模式：
+`legacy`（`connectType=0`，cmd 0 用 flag 4/key4，cmd 1 用 flag 5/key5）或 `new`（cmd 0 用
+flag 14/key14，cmd 1 用 flag 15/key15，key14 = MD5(UTF-8(localKey + secKey))、
+key15 = MD5(UTF-8(localKey + secKey) ‖ srand)）。若设备信息要求 beaconKey，配置中提供有效
+beaconKey 时使用 marker `0x10` 分支；缺失时遵循原版 normal path 的 marker `0x00` fallback。
+只有 cmd 1 PairRep 的 bindStatus 为 0 或 2 才进入 READY。P1、P2、证书认证及其他未实现分支会
+fail closed。`info` 是单独的 cmd 0 诊断探针；cmd 0 应答不等于 READY。
 
 `gatt` 的 `--scan-timeout` 控制发现目标的扫描窗口（默认 60 秒），`--timeout` 单独控制扫描命中后
-BLE 链路连接的超时（默认 20 秒）。扫描命中后会将同一进程捕获的 BLEDevice 直接交给连接器；未命中时
+BLE/GATT 建立过程的超时（默认 20 秒；Windows 上包含服务发现和会话就绪）。扫描命中后会将同一进程捕获的 BLEDevice 直接交给连接器；未命中时
 不会尝试连接地址字符串或触发隐式重扫。
 
-截至 2026-09-28，YouFs 2（App 地址尾号 `00:01`）未出现在本轮扫描结果中；此前捕获到的准确地址
-曾两次连接超时，随后广播消失。因此它的可复现连接、GATT 树、cmd 0/cmd 1 应答均未确认。
-YouFs 车辆的 protocolType、安全 flag、密钥路径和 DP 表仍未由真车验证；通用 Tuya 设备观察不能
-替代 YouFs 实车证据。
+2026-09-29 已实测 YouFs 2（地址尾号 `00:01`，报告中一律使用匿名化占位值）：车辆重新开机后恢复
+可连接广播，GATT 树（FD50、MTU 247）与通知订阅通过；随后 cmd 0/cmd 1 应用层握手、保活应答、
+状态流与 DP 控制（大灯 dp8、模式 dp15）在同一台车上打通。完整实验见
+[连接排查报告](docs/ble_diagnosis_20260929.md) 与 [认证与控制验证报告](docs/ble_auth_verification_20260929.md)。
+该车的 security 分支为**新安全**（cmd 0 flag14/key14、cmd 1 flag15/key15）；legacy flag4/key4
+在同一台车上实车无应答，仍属候选路径而非已验证结论。密钥值不入库，profile 存放在 git 忽略的
+`work/` 内。
 
-> **状态/控制边界**：`status` 不发送 DP 查询；当前 DP 查询/控制仍 fail closed。`connect` 会发 cmd 0
-> 和 cmd 1，因此仅在配置字段与密钥已由可信来源核验后使用。不要猜 DP ID、密钥或安全 flag。
+> **状态/控制边界**：`status` 不发送 DP 查询。`connect` 会发 cmd 0 和 cmd 1，因此仅在配置字段
+> 与密钥已由可信来源核验后使用。`send_dp()` 只应发送车主明确授权的 DP（当前仅 dp8/dp15）；
+> 电机、OTA、解绑类命令不实现。不要猜 DP ID、密钥或安全 flag。
 
 Python API:
 
 ```python
 from youfs import YouFSScooter
 
-async with YouFSScooter(address, session_key=None) as scooter:
-    info = await scooter.fetch_device_info()      # 尝试 cmd 0x0000；应答不等于 pairing-ready
+async with YouFSScooter(address, login_key=..., protocol_type=..., security_mode=...) as scooter:
+    info = await scooter.fetch_device_info()      # cmd 0x0000；应答不等于 pairing-ready
     state = await scooter.wait_for_report()       # 被动等待车辆上报
     print(state.raw_dps)                          # [(dp_id, type, value), ...]
+    await scooter.send_dp(8, 1, True)             # 仅限车主授权的 dpId（READY 之后）
 ```
 
-该低层 API 不代表 pairing-ready；只有 `YouFsConnection` 的 P4 legacy 状态机收到并验证成功 PairRep
-才会进入 READY。DP API 目前仍拒绝发送，直至业务帧路径另行实现并验证。
+低层 `fetch_device_info()` 单独调用不代表 pairing-ready；只有 `YouFsConnection` 状态机收到并验证
+成功 PairRep 才会进入 READY，`send_dp()` 也只在 READY 之后才放行。DP 写入应按
+[认证与控制验证报告](docs/ble_auth_verification_20260929.md) 的授权范围使用。
 
 ## 测试
 
@@ -90,31 +98,40 @@ python -m pytest tests/ -q
 
 | 验收项 | 状态 |
 |---|---|
-| 1 发现 YouFs 2 | **未完成**：当前扫描未见尾号 `00:01` 的车辆广播 |
-| 2 建立到 YouFs 2 的 BLE 连接 | **未验证**：尚无目标广告地址和实车连接结果 |
-| 3 发现 YouFs 2 的 GATT | **未验证**：必须连接后读取服务与特征 UUID |
-| 4 确认 YouFs 2 的 cmd 0 响应 | **未验证**：目标车 GATT 与 cmd 0 应答尚无可复现记录 |
-| 5 pairing-ready / 解析遥测 | **未验证**：离线实现仅覆盖 P4 legacy；未拿到目标车配置或 PairRep；DP 映射待抓包 |
-| 6 控制灯 ON/OFF | **不可用/未完成**：DP 查询/写入仍 fail closed，且灯光 DP、应答均待实车确认 |
+| 1 发现 YouFs 2 | **实车通过**：重启车辆后观察到 RANDOM 类型可连接广播；间歇消失的原因未定 |
+| 2 建立到 YouFs 2 的 BLE 连接 | **实车通过**：原生 WinRT、现有 CLI 与通知探针成功 |
+| 3 发现 YouFs 2 的 GATT | **实车通过**：FD50 通道、MTU 247；通知订阅成功 |
+| 4 确认 YouFs 2 的 cmd 0 响应 | **实车通过**：新安全 flag14/key14 发送，~110ms 收到 DeviceInfoRep，CRC 通过 |
+| 5 pairing-ready / 解析遥测 | **部分通过**：cmd 1 PairRep(bindStatus) 已达成 READY，状态流 32774 已实车收到；`telemetry.parse_report` 尚未识别 pv4 宽长度头 |
+| 6 控制灯 ON/OFF | **实车通过(DP 层)**：`send_dp` 经 cmd 39 发送 dp8，车辆状态流回显 dp8=01；CLI `light` 子命令仍指向旧的配对门控提示 |
 
-**MVP 尚未达成。** 当前缺少 YouFs 2 广播识别、GATT 发现、cmd 0 与配对/业务协议的实车证据；完成这些步骤需要车辆保持 BLE 广播，并在需要时进行真车验证。原版 App 已在 MuMu 启动并显示离线设备面板；面板代码名已部分确认，数字 DP ID 和 BLE 行为仍待真车抓包。云端 API 第三方请求也尚未通过联调，见 `docs/emulator_validation.md`。
+**实车链路已打通**(2026-09-29，单台车)：GATT → cmd0/cmd1 认证 → 保活 → 状态流 → DP 控制。
+已知缺口：`telemetry.parse_report` 未识别 pv4/32774 宽长度 TLV（`state.raw_dps` 仍空，需逐帧手工解析，
+格式已完全掌握）；`send_dp` 默认等待超时 8s，小于设备繁忙时的应答延迟（可达 24s）。云端第三方
+请求的签名已验证，会话/设备/DP schema 已还原，见 `docs/cloud_api.md`。
 
 ## 安全约束执行情况
 
 - ✅ 不刷固件 / 不 OTA / 不动 Flash / 不绕硬件保护
-- ✅ 不实现电机相关命令；除显式 P4 legacy 连接握手外，不提供配对/解绑/OTA 业务命令
-- ✅ DP 查询/控制当前 fail closed;未知命令只分析
-- ✅ 原始 APK 未改动(SHA-256 记录于 app_info.md),抓包原样存 `captures/original/`
+- ✅ 不实现电机相关命令；不提供解绑/OTA 业务命令，也不发送 cmd 5/21-23
+- ✅ DP 写入只经由显式授权的 `send_dp()`(READY 之后)，实车仅发送过车主授权的 dp8/dp15
+- ✅ 原始 APK 未改动(SHA-256 记录于 app_info.md)
+- ✅ 密钥、profile、抓包与真机地址只存于 git 忽略的 `work/`、`captures/`；仓库内设备标识已匿名化
 
 ## 目录
 
 ```
-docs/                  13 份分析文档
-src/youfs/             protocol / transport / scanner / commands / telemetry / scooter
-cli.py  examples/  tests/
-work/                  反编译树(jadx)与提取物(分析过程产物,可删)
-captures/original/     HCI 抓包(待提供)
+docs/                  17 份分析文档(含 2 份 2026-09-29 实车报告)
+src/youfs/             protocol / transport / scanner / commands / telemetry / connection / scooter / cloud
+cli.py  examples/  tests/                  149 个离线测试
+tools/                 抓包/诊断脚本(frida、mitmproxy、WinRT BLE 探针)与本地工具链落地目录
+work/                  反编译树(jadx)、抓包解密产物、profile 与密钥(git 忽略)
+captures/original/     HCI 抓包目录(待硬件提供，git 忽略)
 ```
+
+仓库根另有 `AGENTS.md`(工作区 agent 指令)与 `.agents/skills/apk-reverse/`、`apk-reverse/`、
+`skills-lock.json`(项目级 skill 与上游维护克隆)；这些属于本地工作区配置，前者随仓库分发，
+后两者中的 skill 目录与上游克隆不入库。
 
 ---
 
@@ -124,11 +141,14 @@ captures/original/     HCI 抓包(待提供)
 
 | 路径 | 内容 | 作用域 |
 |---|---|---|
-| [`.agents/skills/apk-reverse/`](.agents/skills/apk-reverse) | 已安装的 skill(`SKILL.md` + `references/` + `scripts/` + `evals/` + `evidence/`) | 项目 |
+| `.agents/skills/apk-reverse/` | 已安装的 skill(`SKILL.md` + `references/` + `scripts/` + `evals/` + `evidence/`)；**git 忽略，克隆后需按下节命令重装** | 项目 |
 | [`skills-lock.json`](skills-lock.json) | `skills` CLI 的锁文件,记录来源与内容哈希,供后续更新/还原 | 项目 |
-| [`apk-reverse/`](apk-reverse) | 上游 git 检出(`newliver666/apk-reverse`),仓库根是跨 skill 的维护工具,不属于已安装 skill | 项目 |
-| [`tools/`](tools) | 项目本地工具链落地区(jadx 1.5.2 已装入 `tools/jadx/`)+ [`env.ps1`](tools/env.ps1) | 项目 |
+| `apk-reverse/` | 上游 git 检出(`newliver666/apk-reverse`),仓库根是跨 skill 的维护工具,不属于已安装 skill；**git 忽略** | 项目 |
+| [`tools/`](tools) | 项目本地工具链落地区 + [`env.ps1`](tools/env.ps1)；jadx 等大体积工具装在 `tools/` 下且不入库 | 项目 |
 | [`AGENTS.md`](AGENTS.md) | 工作区级 agent 指令(每次会话自动加载) | 项目 |
+
+> 从 GitHub 克隆后，`.agents/skills/` 与 `apk-reverse/` 不存在(已被 `.gitignore` 排除)，
+> 需要按下面两条命令重新安装才能使用 apk-reverse skill。
 
 安装方式(仓库 README 记载的官方路径,未使用 `-g`):
 
@@ -162,3 +182,25 @@ npx skills remove apk-reverse -p    # 卸载:移除项目级 skill
 - skill 只存在于本工作区,其他项目不可见。
 - `tools/env.ps1` 只改当前 shell 环境变量,不写任何全局配置文件。
 - 未修改 `~/.dsh/settings.yaml`、`~/.dsh/cordis.yml` 或任何 `~/.agents`、`~/.claude`、`~/.codex` 内容。
+
+## 克隆后重建(本地私有部分)
+
+仓库只包含可公开的分析结论、协议实现与测试；以下内容按设计不入库，克隆后都是空的：
+
+| 不入库内容 | 重建方式 |
+|---|---|
+| `.agents/skills/apk-reverse/` | `npx skills add newliver666/apk-reverse --skill apk-reverse -a universal --copy -y` |
+| `apk-reverse/`(上游维护克隆) | `git clone https://github.com/newliver666/apk-reverse` |
+| `tools/jadx*`、`tools/pydeps/`、`tools/jars/` | `. .\tools\env.ps1` 后按 `tools/README.md` 放入解包目录 |
+| 样本 APK `YouFs-A_1.0.3_APKPure.apk` | 自行获取；SHA-256 见 `docs/app_info.md` |
+| `work/`(反编译树、云端会话、profile 与密钥) | 由 `cli.py cloud …` 与各文档脚本重新生成 |
+| `work/mumu/ecodes.json`(抓包复现用的会话候选值) | 本地留存；缺失时 `tests/test_cloud.py` 的相关用例自动 skip |
+
+测试在没有这些本地产物时仍可运行：依赖抓包语料的用例会 skip，其余用例覆盖协议编解码、
+状态机与 CLI 行为。
+
+## 数据与隐私说明
+
+仓库内的设备标识(车机 MAC、devId、uuid、账号 gid、会话 ecode、手机号)以及两台家用 BLE 设备的
+广播向量均已替换为合成占位值，字节布局与真实抓包一致，因此回归测试仍然有效。真实值只保留在
+本地 git 忽略的 `work/`、`captures/` 中。

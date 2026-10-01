@@ -166,8 +166,14 @@ def _add_protocol_args(p: argparse.ArgumentParser, *, required: bool = True) -> 
     p.add_argument("--protocol-type", type=int,
                    choices=(400, 401, 402, 403, 404, 405, 413), required=required,
                    help="protocolType from verified device/cloud metadata; current codec supports P4 400–405 and 413")
-    p.add_argument("--security-mode", choices=("legacy",), required=required,
-                   help="explicitly confirmed security mode; only P4 legacy cmd0 is implemented")
+    p.add_argument("--security-mode", choices=("legacy", "new"), required=required,
+                   help="explicitly confirmed security mode; 'new' additionally "
+                        "requires the cloud secKey (profile field secKey or --sec-key)")
+
+
+def _add_sec_key_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--sec-key", help="cloud secKey for the new-security key14/key15 "
+                                     "derivation; prefer the work/ profile field secKey")
 
 
 def _resolve_key(args) -> Optional[bytes]:
@@ -287,9 +293,18 @@ def _resolve_connection_config(args) -> dict:
         raise ValueError("profile protocolType/connectType must be JSON integers (not booleans or floats)")
     if fields["protocolType"] not in (400, 401, 402, 403, 404, 405, 413):
         raise ValueError("profile protocolType is unsupported; only verified P4 types are accepted")
-    if fields["connectType"] != 0 or str(fields["securityMode"]).lower() != "legacy":
-        raise ValueError("profile must explicitly select connectType=0 and securityMode=legacy")
-    fields["securityMode"] = "legacy"
+    if fields["connectType"] != 0 or str(fields["securityMode"]).lower() not in ("legacy", "new"):
+        raise ValueError("profile must explicitly select connectType=0 and securityMode=legacy|new")
+    fields["securityMode"] = str(fields["securityMode"]).lower()
+    if fields["securityMode"] == "new":
+        secret_key = _select_consistent_identity(
+            "secKey", getattr(args, "sec_key", None),
+            profile.get("secKey", profile.get("secretKey", profile.get("sec_key"))),
+            (record or {}).get("secKey", (record or {}).get("sec_key")))
+        if not secret_key:
+            raise ValueError(
+                "securityMode=new requires the cloud secKey (profile field secKey or --sec-key)")
+        fields["secKey"] = secret_key
     if not isinstance(fields["uuid"], str) or not isinstance(fields["devId"], str):
         raise ValueError("profile uuid/devId must be strings")
     if not fields["targetMac"]:
@@ -423,15 +438,42 @@ def _gatt_protocol_hints(args, service_uuid: str) -> tuple[Optional[int], Option
         synthesized.append("protocolType=413")
     if (security_mode is None and protocol_type in (413, 400, 401, 402, 403, 404, 405)
             and str(service_uuid).lower() == SERVICE_UUID.lower()):
+        # Diagnostic-only default for a bare FD50 cmd0 probe; an explicitly
+        # provided securityMode is never overridden.
         security_mode = "legacy"
         synthesized.append("securityMode=legacy")
     if type(protocol_type) is not int:
         raise ValueError("cmd0 requires protocolType as an exact integer from profile/cache or an FD50-only candidate")
-    if str(security_mode).lower() != "legacy":
-        raise ValueError("only the P4 legacy cmd0 candidate is implemented; supply securityMode=legacy")
+    if str(security_mode).lower() not in ("legacy", "new"):
+        raise ValueError("securityMode must be 'legacy' or 'new'")
+    if str(security_mode).lower() == "new" and any(s.startswith("securityMode=") for s in synthesized):
+        raise ValueError("securityMode=new must come from explicit profile/CLI metadata, not the FD50 diagnostic default")
     if connect_type is not None and type(connect_type) is not int:
         raise ValueError("connectType must be an exact integer, not a float or boolean")
-    return protocol_type, "legacy", connect_type, synthesized
+    return protocol_type, str(security_mode).lower(), connect_type, synthesized
+
+
+def _resolve_p4_secrets(args) -> tuple[Optional[str], Optional[str]]:
+    """Full localKey and secKey strings for the new-security key14/key15 path."""
+    cloud_device = getattr(args, "cloud_device", None)
+    profile_path = getattr(args, "profile_file", None)
+    record = _find_cached_device(cloud_device) if cloud_device else None
+    profile = _load_connection_profile(profile_path)
+    local_key = None
+    if record:
+        local_key = record.get("localKey")
+    if not local_key and profile:
+        local_key = profile.get("localKey", profile.get("local_key"))
+    secret_key = None
+    if record:
+        secret_key = record.get("secKey", record.get("sec_key"))
+    if not secret_key and profile:
+        secret_key = profile.get("secKey", profile.get("secretKey", profile.get("sec_key")))
+    if getattr(args, "sec_key", None):
+        if secret_key and secret_key != args.sec_key:
+            raise ValueError("--sec-key conflicts with the selected device source")
+        secret_key = args.sec_key
+    return local_key, secret_key
 
 
 def _validate_gatt_target_binding(args) -> None:
@@ -485,12 +527,15 @@ async def cmd_gatt(args) -> int:
                           getattr(args, "pair", False))
     login_key = None
     connection_config = None
+    full_local_key = None
+    sec_key = None
     if wants_protocol:
         try:
             _validate_gatt_target_binding(args)
             login_key = _resolve_local_key(args)
             if login_key is None:
                 raise ValueError("protocol probe requires localKey from --local-key, --cloud-device, or --profile-file")
+            full_local_key, sec_key = _resolve_p4_secrets(args)
             if getattr(args, "pair", False):
                 connection_config = _resolve_connection_config(args)
         except (RuntimeError, ValueError, SystemExit) as exc:
@@ -507,12 +552,16 @@ async def cmd_gatt(args) -> int:
     client = BleakClient(target)
     transport_owner = None
     try:
-        print(f"BLE link: connecting to {args.address} …")
+        print(f"BLE/GATT setup: connecting to {args.address} …")
         await asyncio.wait_for(client.connect(), timeout=args.timeout)
+    except asyncio.CancelledError:
+        await _disconnect_after_failed_connect(client)
+        raise
     except Exception as exc:
-        _print_connection_error(exc, "BLE link")
-        print("suggestion: confirm the advertised address, power, range, and Windows BLE permission; "
-              "if the target is not advertising, protocol-level testing cannot start")
+        await _disconnect_after_failed_connect(client)
+        _print_connection_error(exc, "BLE/GATT setup")
+        print("suggestion: BleakClient.connect() on Windows also retrieves GATT services and waits "
+              "for the GATT session; a timeout here does not isolate radio-link failure")
         return 2
     try:
         print(f"connected: {args.address}  mtu={getattr(client, 'mtu_size', '?')}")
@@ -571,6 +620,8 @@ async def cmd_gatt(args) -> int:
                 protocol_type=protocol_type,
                 security_mode=security_mode,
                 login_key=login_key[:6],
+                login_key_complete=full_local_key,
+                secret_key=sec_key,
                 ble_device=target,
                 service_uuid=channel[0], write_uuid=channel[1],
                 notify_uuid=channel[2])
@@ -578,20 +629,22 @@ async def cmd_gatt(args) -> int:
             transport_owner = scooter_client
             _report_connection_ready(scooter_client)
             if connection_config is None:
-                print("cmd 0x0000: sending read-only P4 candidate request …")
+                print(f"cmd 0x0000: sending read-only P4 candidate request "
+                      f"(securityMode={security_mode}) …")
                 info = await scooter_client.fetch_device_info()
                 if info is None:
                     print("cmd 0x0000 response: timeout; protocol/security candidate not validated")
                     return 3
-                print("cmd 0x0000 response: validated CRC/code/ack/security flag=4")
+                expected_flag = 14 if security_mode == "new" else 4
+                print(f"cmd 0x0000 response: validated CRC/code/ack/security flag={expected_flag}")
                 print(f"protocol_version={info.protocol_version}; srand received ({len(info.srand)} bytes; value suppressed)")
                 print("pairing-ready: not established; this probe sent no cmd1 or DP/control")
             else:
                 print("application handshake: cmd 0x0000 then pairing cmd 0x0001")
                 info = await scooter_client.establish_protocol(
                     connection_config, timeout=args.protocol_timeout)
-                print(f"cmd 0x0000 response: validated; protocol={info.protocol_version}; security flag=4")
-                print("cmd 0x0001 PairRep: validated")
+                print(f"cmd 0x0000 response: validated; protocol={info.protocol_version}")
+                print(f"cmd 0x0001 PairRep: validated (session flag={scooter_client.connection.session_flag})")
                 print(f"pairing-ready: established; bind_status={scooter_client.connection.bind_status}")
                 print("No DP or vehicle-control command was sent.")
         except (RuntimeError, ValueError, SystemExit) as exc:
@@ -713,6 +766,8 @@ async def cmd_connect(args) -> int:
         print(f"BLE scan: matched requested address {args.address}; connecting with scan-time device")
         async with YouFSScooter(
                 args.address, login_key=config["localKey"][:6].encode("utf-8"),
+                login_key_complete=config["localKey"],
+                secret_key=config.get("secKey"),
                 protocol_type=config["protocolType"],
                 security_mode=config["securityMode"],
                 ble_device=target,
@@ -724,7 +779,7 @@ async def cmd_connect(args) -> int:
             print("application handshake: cmd 0x0000 then pairing cmd 0x0001")
             info = await sc.establish_protocol(config, timeout=args.timeout)
             print(f"cmd 0x0000 response: validated; protocol={info.protocol_version}; srand received ({len(info.srand)} bytes)")
-            print("cmd 0x0001 PairRep: validated")
+            print(f"cmd 0x0001 PairRep: validated (session flag={sc.connection.session_flag})")
             print(f"pairing-ready: established; bind_status={sc.connection.bind_status}")
             print("DP/control readiness is gated on this PairRep; this command sends no DP control.")
     except Exception as exc:
@@ -747,6 +802,14 @@ def _print_connection_error(exc: Exception, phase: str) -> None:
     if not detail:
         detail = "no diagnostic text supplied by the BLE backend"
     print(f"{layer or phase} ({type(exc).__name__}): {detail}")
+
+
+async def _disconnect_after_failed_connect(client, timeout: float = 3.0) -> None:
+    """Best-effort bounded cleanup that never replaces the connect failure."""
+    try:
+        await asyncio.wait_for(client.disconnect(), timeout=timeout)
+    except (Exception, asyncio.CancelledError):
+        pass
 
 
 def _report_connection_ready(sc) -> None:
@@ -940,8 +1003,9 @@ def main(argv=None) -> int:
     p.add_argument("--scan-timeout", type=float, default=60.0,
                    help="maximum BLE discovery window in seconds (default: 60)")
     p.add_argument("--timeout", type=float, default=20.0,
-                   help="BLE link connection timeout in seconds after discovery (default: 20)")
+                   help="BLE/GATT setup timeout in seconds after scanning (default: 20)")
     _add_local_key_args(p)
+    _add_sec_key_args(p)
     _add_protocol_args(p, required=False)
     p.add_argument("--connect-type", type=int, choices=(0,),
                    help="explicit P4 pairing connectType; only 0 is implemented")
@@ -977,10 +1041,11 @@ def main(argv=None) -> int:
     _add_gatt_args(p)
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("connect", help="explicit P4 legacy connection handshake (cmd 0 + pairing cmd 1)")
+    p = sub.add_parser("connect", help="explicit P4 connection handshake (cmd 0 + pairing cmd 1)")
     p.add_argument("address")
     p.add_argument("--timeout", type=float, default=6.0)
     _add_local_key_args(p)
+    _add_sec_key_args(p)
     _add_protocol_args(p, required=False)
     p.add_argument("--connect-type", type=int, choices=(0,),
                    help="APK connectType; only explicitly selected normal path 0 is implemented")

@@ -164,11 +164,13 @@ class TrsmitrAssembler:
 
     def feed(self, packet: bytes) -> Optional[Tuple[int, int, bytes]]:
         """Feed one BLE packet. Returns (cmd_nibble, seq, payload) when the
-        frame is complete, else None.  Raises ValueError on gap/oversize."""
-        if len(packet) > 20:
-            # native receiver rejects >20; tolerate larger only if the radio
-            # negotiated a bigger MTU — keep the frame logic identical.
-            pass
+        frame is complete, else None.  Raises ValueError on non-increasing
+        index/oversize.
+
+        The APK BaseReceiver accepts any strictly increasing packet index
+        (``index <= last`` is the only error) and ignores the header's low
+        nibble on receive; both behaviours are reproduced here.
+        """
         idx, pos = varint_decode(packet)
         if idx == 0:
             total, pos = varint_decode(packet, pos)
@@ -183,9 +185,9 @@ class TrsmitrAssembler:
             self._next_idx = 0
         elif self._total is None:
             raise ValueError("trsmitr continuation before first packet")
-        elif idx != self._next_idx:
+        elif idx <= self._next_idx - 1:
             self.reset()
-            raise ValueError(f"trsmitr packet gap: got idx {idx}, want {self._next_idx}")
+            raise ValueError(f"trsmitr packet index not increasing: got {idx}, last was {self._next_idx - 1}")
         self._next_idx = idx + 1
         self._buf += packet[pos:]
         if self._total is not None and len(self._buf) >= self._total:
@@ -423,12 +425,13 @@ def parse_ret(raw: bytes, key: Optional[bytes] = None,
     frame_end = 14 + length
     if frame_end > len(body):
         raise ValueError("declared frame length exceeds available body")
-    # Encrypted X2 frames are zero-padded to an AES block; plaintext frames
-    # have no padding. Reject unexpected bytes rather than parsing a prefix.
+    # The APK (Ret.parse) never rejects trailing bytes after the declared
+    # frame; the CRC over sn..data is the integrity check. Observed on the
+    # real vehicle: the device pads encrypted frames with its pad length
+    # (e.g. 02 02) instead of zeros, so encrypted tails must not be compared
+    # against zero padding.
     if flag == 0 and frame_end != len(body):
         raise ValueError("plaintext frame length does not match body")
-    if flag != 0 and any(body[frame_end:]):
-        raise ValueError("encrypted frame has non-zero padding")
     data = body[12:12 + length]
     recv_crc = int.from_bytes(body[12 + length:14 + length], "big")
     calc_crc = crc16_modbus(body[:12 + length])
@@ -453,6 +456,26 @@ def derive_key4(login_key: bytes) -> bytes:
     ppbpqqq.pdqppqb(); this is distinct from flag-5 key derivation.
     """
     return hashlib.md5(login_key).digest()
+
+
+def derive_key14(login_key_complete: str, secret_key: str) -> bytes:
+    """key14 = MD5(UTF-8(loginKeyComplete + secretKey)) — P4 new-security cmd0.
+
+    Evidence: dpqbbpd.getSecretKey14() hashes bddqpdp.bppdpdq(str + str2),
+    i.e. plain UTF-8 of the concatenated cloud localKey and secKey strings
+    with no separator and no inner hash.
+    """
+    return hashlib.md5((login_key_complete + secret_key).encode("utf-8")).digest()
+
+
+def derive_key15(login_key_complete: str, secret_key: str, srand: bytes) -> bytes:
+    """key15 = MD5(UTF-8(loginKeyComplete + secretKey) || srand) — new-security session.
+
+    Evidence: dpqbbpd.getSecretKey15() = MD5(concat(getBytes(loginKeyComplete+
+    secretKey), srand)).  Unlike key2 there is NO inner MD5 of the secret input.
+    """
+    return hashlib.md5(
+        (login_key_complete + secret_key).encode("utf-8") + srand).digest()
 
 
 def derive_key2(secret: bytes, srand: bytes) -> bytes:

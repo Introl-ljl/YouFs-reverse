@@ -6,6 +6,8 @@ import json
 import os
 from types import SimpleNamespace
 
+import pytest
+
 import cli
 from youfs import scooter
 
@@ -156,6 +158,57 @@ def test_gatt_uses_independent_scan_and_connection_timeouts(monkeypatch, capsys)
     capsys.readouterr()
 
 
+@pytest.mark.parametrize("failure", [asyncio.TimeoutError, asyncio.CancelledError])
+def test_gatt_failed_connect_disconnects_with_bounded_cleanup(
+        monkeypatch, capsys, failure):
+    import sys
+
+    scan_device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF")
+    captured = {"waits": []}
+
+    async def fake_scan(address, timeout=8.0):
+        return scan_device
+
+    class FakeBleakClient:
+        def __init__(self, device):
+            self.is_connected = False
+            captured["client"] = self
+
+        async def connect(self):
+            captured["connect_started"] = True
+
+        async def disconnect(self):
+            captured["disconnect_started"] = True
+            raise RuntimeError("simulated cleanup failure")
+
+    async def fake_wait_for(awaitable, timeout):
+        captured["waits"].append(timeout)
+        if len(captured["waits"]) == 1:
+            await awaitable
+            raise failure()
+        await awaitable
+
+    monkeypatch.setattr(cli, "_scan_ble_device", fake_scan)
+    monkeypatch.setitem(sys.modules, "bleak",
+                        SimpleNamespace(BleakClient=FakeBleakClient))
+    monkeypatch.setattr(cli.asyncio, "wait_for", fake_wait_for)
+    args = SimpleNamespace(address=scan_device.address, scan_timeout=60.0,
+                           timeout=30.0)
+
+    if failure is asyncio.CancelledError:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(cli.cmd_gatt(args))
+    else:
+        assert asyncio.run(cli.cmd_gatt(args)) == 2
+        output = capsys.readouterr().out
+        assert "BLE/GATT setup" in output
+        assert "does not isolate radio-link failure" in output
+
+    assert captured["connect_started"]
+    assert captured["disconnect_started"]
+    assert captured["waits"] == [30.0, 3.0]
+
+
 def test_gatt_scan_miss_does_not_construct_or_connect_bleak(monkeypatch, capsys):
     import sys
 
@@ -219,7 +272,7 @@ def _gatt_protocol_test_fakes(monkeypatch, *, pair=False):
                 is_connected=True, notify_ready=True,
                 service_uuid=kwargs["service_uuid"],
                 write_uuid=kwargs["write_uuid"], notify_uuid=kwargs["notify_uuid"])
-            self.connection = SimpleNamespace(bind_status=True)
+            self.connection = SimpleNamespace(bind_status=True, session_flag=5)
 
         async def attach_connected_client(self, client):
             assert client.is_connected
@@ -433,28 +486,51 @@ def test_light_refuses_before_ble_or_control_write(monkeypatch, capsys):
     assert "pairing is not implemented or verified" in capsys.readouterr().out
 
 
-def test_scooter_refuses_all_dp_requests_until_pairing(monkeypatch):
+def test_scooter_dp_query_requires_ready_and_control_stays_refused(monkeypatch):
     class FakeTransport:
         def __init__(self, **kwargs):
-            pass
+            self.sent = []
 
         async def send_frame(self, payload):
-            raise AssertionError("no frame should be sent")
+            self.sent.append(payload)
 
     monkeypatch.setattr(scooter, "YouFsTransport", FakeTransport)
-    client = scooter.YouFSScooter("AA:BB", session_key=bytes(16), security_flag=5)
 
-    async def attempt():
+    # Before the verified pairing handshake (no session key/flag): everything
+    # application-level is refused.
+    client = scooter.YouFSScooter("AA:BB")
+
+    async def attempt_refused():
         for operation in (client.get_state(), client.set_light(True, dp_id=20),
+                          client._request(scooter.C.CMD_DP_QUERY),
                           client._request(scooter.C.CMD_DP_SEND)):
             try:
                 await operation
             except RuntimeError as exc:
-                assert "pairing" in str(exc)
+                assert "refused" in str(exc)
             else:
                 raise AssertionError("DP operation passed before pairing")
 
-    asyncio.run(attempt())
+    asyncio.run(attempt_refused())
+
+    # After a verified READY (session key/flag set by cmd0/cmd1): the
+    # read-only DP query is allowed; DP control stays refused.
+    ready = scooter.YouFSScooter("AA:BB", session_key=bytes(16), security_flag=5,
+                                 request_timeout=0.05)
+
+    async def attempt_ready():
+        state = await ready.get_state()   # times out with no device reply
+        for operation in (ready.set_light(True, dp_id=20),
+                          ready._request(scooter.C.CMD_DP_SEND)):
+            try:
+                await operation
+            except RuntimeError as exc:
+                assert "refused" in str(exc)
+            else:
+                raise AssertionError("DP control passed after pairing")
+
+    asyncio.run(attempt_ready())
+    assert ready.transport.sent, "READY session must be allowed to send cmd3"
 
 
 def test_scooter_forwards_all_explicit_gatt_uuids(monkeypatch):
@@ -514,7 +590,8 @@ def test_scooter_cmd0_matches_p4_legacy_request_and_validates_response():
 
         async def send_frame(self, frame):
             self.writes.append(frame)
-            response = build_app_frame(sn=7, sn_ack=0, code=0,
+            # The APK answers with sn_ack echoing the request's sn (1 first).
+            response = build_app_frame(sn=7, sn_ack=1, code=0,
                                        data=response_data,
                                        key=derive_key4(login_key), flag=4,
                                        iv=bytes(16))
@@ -753,7 +830,7 @@ def test_connect_command_calls_explicit_connection_state_machine(monkeypatch, ca
             self.transport = SimpleNamespace(
                 is_connected=True, notify_ready=True, service_uuid="svc",
                 write_uuid="write", notify_uuid="notify")
-            self.connection = SimpleNamespace(bind_status=True)
+            self.connection = SimpleNamespace(bind_status=True, session_flag=5)
 
         async def __aenter__(self):
             return self
